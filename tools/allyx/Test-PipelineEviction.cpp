@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <deque>
 #include <iostream>
@@ -17,6 +18,18 @@ void Check(bool value) {
 }
 
 int main() {
+    // Every hash belongs to exactly one shard; expired shard indices match none.
+    for (std::size_t hash = 0; hash < 1024; ++hash) {
+        std::size_t matches = 0;
+        for (std::size_t shard = 0; shard < Vulkan::GraphicsEvictionShardCount; ++shard) {
+            matches += Vulkan::InGraphicsEvictionShard(hash, shard) ? 1 : 0;
+        }
+        Check(matches == 1);
+    }
+    Check(!Vulkan::InGraphicsEvictionShard(0, Vulkan::GraphicsEvictionShardCount));
+    Check(Vulkan::GraphicsEvictionQueueEnd(0, 5000) == 64);
+    Check(Vulkan::GraphicsEvictionQueueEnd(64, 100) == 100);
+    Check(Vulkan::GraphicsEvictionQueueEnd(100, 100) == 100);
     std::deque<int> candidates;
     std::chrono::steady_clock::time_point time{};
     std::chrono::microseconds cost{};

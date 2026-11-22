@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
+#include <optional>
 #include <stop_token>
 #include <functional>
 #include <mutex>
@@ -586,6 +587,20 @@ private:
     void EvictUnusedPipelines();
     void DrainPendingGraphicsEvictions();
     std::deque<std::pair<u64, GraphicsPipelineCacheKey>> pending_graphics_evictions;
+    // GPU-thread-only selection state. Copies keys because graphics_cache is a Boost flat map:
+    // retaining iterators or references across frames is unsafe when new keys rehash it.
+    struct GraphicsEvictionSelection {
+        std::size_t shard{};
+        std::size_t built{};
+        std::size_t kept_prebuilt{};
+        std::size_t evict_above{};
+        std::size_t selected{};
+        std::size_t queued{};
+        u64 cutoff{};
+        std::vector<std::pair<u64, GraphicsPipelineCacheKey>> candidates;
+        std::vector<std::size_t> order; // nth_element only moves indices, not large keys
+    };
+    std::optional<GraphicsEvictionSelection> graphics_eviction_selection;
     u64 pending_eviction_cutoff{};
     size_t pending_eviction_removed{};
     size_t pending_eviction_frames{};

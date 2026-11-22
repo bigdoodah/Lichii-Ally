@@ -5924,8 +5924,10 @@ void PipelineCache::TickFrame() {
         retired_compute_pipelines.pop_front();
     }
     constexpr u64 EvictCheckFrames = 600;
-    if (frame_count % EvictCheckFrames == 0) {
+    if (frame_count % EvictCheckFrames == 0 || graphics_eviction_selection.has_value()) {
         EvictUnusedPipelines();
+    }
+    if (frame_count % EvictCheckFrames == 0) {
         if (const int mode = VideoCore::Nx2Debug::Experiment(51); mode != 0) {
             EvictUnusedComputePipelines(mode);
         }
@@ -5981,80 +5983,85 @@ void PipelineCache::RetireTranslatedPipeline(std::unique_ptr<GraphicsPipeline> p
 }
 
 void PipelineCache::EvictUnusedPipelines() {
-    if (!pending_graphics_evictions.empty()) {
-        return;
-    }
-    // Building a pipeline again on MoltenVK means a Metal compile mid-game, far dearer than the
-    // 2-3 ms below, so none are evicted there.
-    if (device.IsMoltenVK()) {
-        return;
-    }
-    // EDEN_NX2_PRELOAD_ALL_PIPELINES asked for every cached pipeline built: evicting the ones not
-    // used yet threw the preload away after 9000 frames (Ocarina: 22,510 of 24,285, then rebuilt
-    // one by one in new places).
-    if (PreloadAllPipelines()) {
-        return;
-    }
-    // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
-    // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
-    // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
     constexpr u64 EvictAfterFrames = 9000;
-    if (frame_count <= EvictAfterFrames) {
-        return;
-    }
-    VideoCommon::FrameEndTrace::Scope trace{"graphics pipeline eviction selection"};
-    // Only while the cache is large: each one evicted is translated again on the GPU thread when
-    // its place is revisited (~10 ms). Ocarina of Time kept ~1,900 of them and evicted 3,400 in
-    // 25 minutes of play, then rebuilt 1,850 (14 s of stalls, 3.8 s in one 10 s window). The
-    // threshold scales with the RAM (EvictAbovePipelines: 32 GB ~4,560, ~2 GB of driver memory).
-    // EDEN_NX2_PIPELINE_EVICT_ABOVE sets it.
-    // Past it only the excess goes, least recently used first (from zortos293/Lichii#408), so
-    // crossing it doesn't drop every stale pipeline at once.
-    const size_t evict_above = EvictAbovePipelines();
-    if (graphics_cache.size() <= evict_above) {
-        return;
-    }
-    // Count resident built objects, not failed/null or pending entries (Lichii PR #1334).
-    size_t built = 0;
-    const u64 cutoff = frame_count - EvictAfterFrames;
-    // A pipeline built from the disk cache at boot that no draw has used yet stays, up to a budget
-    // (from zortos293/Lichii#550): evicting it throws the prebuild away, and the game translates it
-    // again on the GPU thread when it reaches that content. Past the budget (~0.9 GB of driver
-    // memory) they go like the rest, so a large cache can't hold their memory all session.
     constexpr size_t MaxUnusedPrebuiltPipelines = 2000;
-    size_t kept_prebuilt = 0;
-    // These references live only during this scan, before any cache mutation. Sort compact
-    // records and copy only the selected keys into the queue that survives this frame.
-    std::vector<std::pair<u64, const GraphicsPipelineCacheKey*>> candidates;
-    for (const auto& [key, pipeline] : graphics_cache) {
-        if (pipeline == nullptr || !pipeline->IsBuilt()) {
-            continue;
+
+    // Start only at a periodic cache check; finish an already-started scan every frame.
+    // Never overlap a scan with an earlier batch still awaiting eviction.
+    if (!graphics_eviction_selection) {
+        if (!pending_graphics_evictions.empty() || device.IsMoltenVK() ||
+            PreloadAllPipelines() || frame_count <= EvictAfterFrames) {
+            return;
         }
-        ++built;
-        if (pipeline.get() == current_pipeline ||
-            pipeline->LastUse() >= cutoff) {
-            continue;
+        const size_t evict_above = EvictAbovePipelines();
+        if (graphics_cache.size() <= evict_above) {
+            return;
         }
-        if (!pipeline->WasUsed() && kept_prebuilt < MaxUnusedPrebuiltPipelines) {
-            ++kept_prebuilt;
-            continue;
+        auto& initial = graphics_eviction_selection.emplace();
+        initial.evict_above = evict_above;
+        initial.cutoff = frame_count - EvictAfterFrames;
+    }
+
+    VideoCommon::FrameEndTrace::Scope trace{"graphics pipeline eviction selection"};
+    auto& state = *graphics_eviction_selection;
+    if (state.shard < GraphicsEvictionShardCount) {
+        // Hash partitioning needs no long-lived map iterator: Boost's flat map can rehash
+        // between frames when the game compiles a new pipeline.
+        const size_t shard = state.shard++;
+        for (const auto& [key, pipeline] : graphics_cache) {
+            if (!InGraphicsEvictionShard(key.Hash(), shard) || pipeline == nullptr ||
+                !pipeline->IsBuilt()) {
+                continue;
+            }
+            ++state.built;
+            const u64 last_use = pipeline->LastUse();
+            if (pipeline.get() == current_pipeline || last_use >= state.cutoff) {
+                continue;
+            }
+            // Preserve the existing budget of prebuilt, never-used pipelines.
+            if (!pipeline->WasUsed() && state.kept_prebuilt < MaxUnusedPrebuiltPipelines) {
+                ++state.kept_prebuilt;
+                continue;
+            }
+            state.candidates.emplace_back(last_use, key);
         }
-        candidates.emplace_back(pipeline->LastUse(), &key);
+        if (state.shard < GraphicsEvictionShardCount) {
+            return;
+        }
+
+        // Only the excess built objects are selected; the oldest eligible keys win.
+        // Sorting indices avoids repeatedly moving large GraphicsPipelineCacheKey objects.
+        state.selected = VideoCommon::GraphicsPipelinesToEvict(
+            state.built, state.candidates.size(), state.evict_above);
+        if (state.selected == 0) {
+            graphics_eviction_selection.reset();
+            return;
+        }
+        state.order.resize(state.candidates.size());
+        std::iota(state.order.begin(), state.order.end(), size_t{0});
+        if (state.selected < state.order.size()) {
+            std::nth_element(state.order.begin(), state.order.begin() + (state.selected - 1),
+                             state.order.end(), [&](size_t lhs, size_t rhs) {
+                                 return state.candidates[lhs].first < state.candidates[rhs].first;
+                             });
+        }
+        pending_eviction_cutoff = state.cutoff;
+        pending_eviction_removed = 0;
+        pending_eviction_frames = 0;
+        LOG_INFO(Render_Vulkan,
+                 "Selected {} unused graphics pipelines in {} frame shards; queueing {} per frame",
+                 state.selected, GraphicsEvictionShardCount, GraphicsEvictionQueueBatch);
     }
-    const size_t evicted =
-        VideoCommon::GraphicsPipelinesToEvict(built, candidates.size(), evict_above);
-    if (evicted == 0) {
-        return;
+
+    // Draining already has a separate 1 ms / 32-entry budget. Bound queue construction too.
+    const size_t end = GraphicsEvictionQueueEnd(state.queued, state.selected);
+    for (; state.queued < end; ++state.queued) {
+        const auto& candidate = state.candidates[state.order[state.queued]];
+        pending_graphics_evictions.emplace_back(candidate.first, candidate.second);
     }
-    std::nth_element(candidates.begin(), candidates.begin() + (evicted - 1), candidates.end(),
-                     [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
-    pending_eviction_cutoff = cutoff;
-    pending_eviction_removed = 0;
-    pending_eviction_frames = 0;
-    for (size_t i = 0; i < evicted; ++i) {
-        pending_graphics_evictions.emplace_back(candidates[i].first, *candidates[i].second);
+    if (state.queued == state.selected) {
+        graphics_eviction_selection.reset();
     }
-    LOG_INFO(Render_Vulkan, "Queued {} unused graphics pipelines for bounded eviction", evicted);
 }
 
 void PipelineCache::DrainPendingGraphicsEvictions() {
@@ -6093,7 +6100,7 @@ void PipelineCache::DrainPendingGraphicsEvictions() {
         },
         [] { return std::chrono::steady_clock::now(); }, Common::IsHostLowOnMemory());
     ++pending_eviction_frames;
-    if (pending_graphics_evictions.empty()) {
+    if (pending_graphics_evictions.empty() && !graphics_eviction_selection) {
         LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines across {} frame batches, {} left",
                  pending_eviction_removed, pending_eviction_frames, graphics_cache.size());
     }

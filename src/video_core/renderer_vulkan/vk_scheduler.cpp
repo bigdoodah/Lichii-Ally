@@ -47,15 +47,23 @@ bool TextureWaitTraceEnabled() {
     return enabled;
 }
 
-void ReportSlowTextureWait(const char* site, double milliseconds, u64 tick) {
+void ReportSlowTextureWait(const char* site, double milliseconds, u64 tick,
+                           double queue_ms = -1.0, double execution_ms = -1.0) {
     if (milliseconds < 100.0) {
         return;
     }
     static std::atomic<u32> reports{};
     if (reports.fetch_add(1, std::memory_order_relaxed) < 256) {
-        LOG_WARNING(Render_Vulkan,
-                    "Slow scheduler wait: {} {:.2f} ms, tick {}; CPU wall time, not GPU duration",
-                    site, milliseconds, tick);
+        if (queue_ms >= 0.0 && execution_ms >= 0.0) {
+            LOG_WARNING(Render_Vulkan,
+                        "Slow scheduler wait: {} {:.2f} ms, tick {}; queue/dispatch "
+                        "{:.2f} ms, execution mutex {:.2f} ms; CPU wall time, not GPU duration",
+                        site, milliseconds, tick, queue_ms, execution_ms);
+        } else {
+            LOG_WARNING(Render_Vulkan,
+                        "Slow scheduler wait: {} {:.2f} ms, tick {}; CPU wall time, not GPU duration",
+                        site, milliseconds, tick);
+        }
     }
 }
 
@@ -350,9 +358,13 @@ void Scheduler::WaitWorker() {
     // chunk it is running.
     Common::Nx2Timeline::Span timeline_span{"wait for Vulkan worker"};
     // Ensure the queue is drained.
+    std::chrono::steady_clock::time_point queue_drained{};
     {
         std::unique_lock ql{queue_mutex};
         event_cv.wait(ql, [this] { return work_queue.empty(); });
+        if (trace_texture_wait) {
+            queue_drained = std::chrono::steady_clock::now();
+        }
     }
 
     // Now wait for execution to finish.
@@ -360,11 +372,11 @@ void Scheduler::WaitWorker() {
         std::scoped_lock el{execution_mutex};
     }
     if (trace_texture_wait) {
-        ReportSlowTextureWait("Vulkan worker drain",
-                              std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - worker_wait_start)
-                                  .count(),
-                              0);
+        const auto finished = std::chrono::steady_clock::now();
+        using Ms = std::chrono::duration<double, std::milli>;
+        ReportSlowTextureWait("Vulkan worker drain", Ms{finished - worker_wait_start}.count(),
+                              0, Ms{queue_drained - worker_wait_start}.count(),
+                              Ms{finished - queue_drained}.count());
     }
 }
 

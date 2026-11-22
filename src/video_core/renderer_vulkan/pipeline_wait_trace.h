@@ -7,13 +7,14 @@
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "video_core/renderer_vulkan/trace_switch.h"
 
 namespace Vulkan::PipelineWaitTrace {
 
 using Clock = std::chrono::steady_clock;
 
 inline bool Enabled() {
-    static const bool enabled = std::getenv("EDEN_NX2_LIST_WAIT_TRACE") != nullptr;
+    static const bool enabled = TraceSwitch::Enabled("EDEN_NX2_LIST_WAIT_TRACE");
     return enabled;
 }
 

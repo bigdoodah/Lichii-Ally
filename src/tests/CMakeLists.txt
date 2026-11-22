@@ -70,6 +70,7 @@ add_executable(tests
     video_core/oot_network.cpp
     video_core/page_filter.cpp
     video_core/pipeline_binary_policy.cpp
+    video_core/trace_switch.cpp
     video_core/pipeline_cache_policy.cpp
     video_core/spirv_storage_alignment.cpp
     video_core/pipeline_optimization.cpp

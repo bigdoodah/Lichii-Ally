@@ -10,6 +10,7 @@
 #include <ranges>
 #include "common/settings.h"
 #include "video_core/renderer_vulkan/list_submit_trace.h"
+#include "video_core/renderer_vulkan/trace_switch.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -19,7 +20,7 @@ namespace Vulkan {
 constexpr u64 FENCE_RESERVE_SIZE = 8;
 
 MasterSemaphore::MasterSemaphore(const Device& device_)
-    : device(device_), list_submit_trace{std::getenv("EDEN_NX2_LIST_WAIT_TRACE")
+    : device(device_), list_submit_trace{TraceSwitch::Enabled("EDEN_NX2_LIST_WAIT_TRACE")
                                              ? std::make_unique<ListSubmitTrace>()
                                              : nullptr} {
     if (!device.HasTimelineSemaphore()) {
@@ -109,6 +110,13 @@ void MasterSemaphore::Wait(u64 tick) {
         return;
     }
 
+    // Only the opted-in diagnostic path reads a wall clock or emits an extra log.
+    // This is an observation of host-side waiting, not Vulkan GPU execution time.
+    const bool trace_completion = list_submit_trace != nullptr;
+    const auto entry_tick = trace_completion ? KnownGpuTick() : u64{0};
+    const auto wait_started = trace_completion ? ListSubmitTrace::Clock::now()
+                                               : ListSubmitTrace::Clock::time_point{};
+
     // If none of the above is hit, fallback to a regular wait
     try {
         while (!semaphore.Wait(tick)) {
@@ -120,6 +128,21 @@ void MasterSemaphore::Wait(u64 tick) {
     }
 
     Refresh();
+    if (trace_completion) {
+        const auto elapsed = ListSubmitTrace::Clock::now() - wait_started;
+        if (elapsed >= std::chrono::milliseconds{500}) {
+            static std::atomic<u32> reports{};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 128) {
+                using Ms = std::chrono::duration<double, std::milli>;
+                LOG_WARNING(Render_Vulkan,
+                            "GPU completion wait: {:.2f} ms CPU wall for tick {}; known GPU "
+                            "tick on entry {}, after wait {}, last successful queue-submit "
+                            "return {} (not a GPU execution timer)",
+                            Ms{elapsed}.count(), tick, entry_tick, KnownGpuTick(),
+                            last_returned_submit_tick.load(std::memory_order_relaxed));
+            }
+        }
+    }
 }
 
 VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,

@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/pipeline_optimization.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
+#include "video_core/renderer_vulkan/pipeline_wait_trace.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
@@ -360,14 +361,15 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     }
 }
 
-void ComputePipeline::RunBuild() {
+bool ComputePipeline::RunBuild() {
     // A draw or dispatch that needs the pipeline builds it on the scheduler thread instead of
     // waiting for the worker queue, which can hold hundreds of builds, to reach it.
     if (build_claimed.exchange(true)) {
-        return;
+        return false;
     }
     build_task();
     build_task = nullptr;
+    return true;
 }
 
 bool ComputePipeline::CanReplaceOcarinaUpscale() const {
@@ -661,12 +663,25 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         return false;
     }
 
-    if (!is_built.load(std::memory_order::relaxed)) {
-        // Wait for the pipeline to be built
-        scheduler.Record([this](vk::CommandBuffer) {
-            RunBuild();
-            std::unique_lock lock{build_mutex};
-            build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+    if (!IsBuilt()) {
+        scheduler.Record([this, tick = scheduler.CurrentTick()](vk::CommandBuffer) {
+            if (IsBuilt()) {
+                return;
+            }
+            const bool trace = PipelineWaitTrace::Enabled();
+            const auto begin = trace ? PipelineWaitTrace::Clock::now()
+                                     : PipelineWaitTrace::Clock::time_point{};
+            const bool ran_build = RunBuild();
+            {
+                std::unique_lock lock{build_mutex};
+                build_condvar.wait(lock, [this] { return IsBuilt(); });
+            }
+            if (trace) {
+                const auto end = PipelineWaitTrace::Clock::now();
+                if (PipelineWaitTrace::ShouldReport(end - begin, end)) {
+                    PipelineWaitTrace::Report("compute", shader_hash, tick, ran_build, end - begin);
+                }
+            }
         });
     }
 

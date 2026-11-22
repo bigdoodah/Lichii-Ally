@@ -54,6 +54,7 @@
 #include "video_core/async_translate.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/frame_end_trace.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
@@ -65,6 +66,8 @@
 #include "video_core/renderer_vulkan/mesh_fallback_limits.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
+#include "video_core/renderer_vulkan/pipeline_eviction.h"
+#include "video_core/renderer_vulkan/pipeline_retirement.h"
 #include "video_core/renderer_vulkan/pipeline_shader_emission.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
@@ -677,6 +680,19 @@ bool DriverCachesPipelines(const Device& device) {
 }
 } // Anonymous namespace
 
+static std::optional<Common::ThreadPriority> ForegroundPipelinePriority(const Device& device) {
+#ifdef _WIN32
+    const char* override_value = std::getenv("EDEN_ALLYX_PIPELINE_PRIORITY");
+    if (device.IsIntegrated() &&
+        !(override_value && std::string_view{override_value} == "0")) {
+        // These workers can block submission of the current frame. Keep background prebuild
+        // and serialization pools at their existing priorities.
+        return Common::ThreadPriority::Normal;
+    }
+#endif
+    return std::nullopt;
+}
+
 PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                              const Device& device_, Scheduler& scheduler_,
                              DescriptorPool& descriptor_pool_,
@@ -700,9 +716,13 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                                                                    : GetTotalPipelineWorkers()},
       emission_budget{num_pipeline_workers},
       workers(num_pipeline_workers,
-              "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
+              "VkPipelineBuilder", {}, Common::ThreadPlacement::Background,
+              ForegroundPipelinePriority(device)),
       serialization_thread(1, "VkPipelineSerialization", {},
                            Common::ThreadPlacement::Background) {
+    LOG_INFO(Render_Vulkan, "Foreground pipeline compiler: {} workers, {} priority",
+             num_pipeline_workers,
+             ForegroundPipelinePriority(device) ? "normal" : "below normal");
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -1918,6 +1938,9 @@ PipelineCache::~PipelineCache() {
     DestroyPipelinesWithProgress(graphics_cache);
     DestroyPipelinesWithProgress(evicted_pipelines);
     DestroyPipelinesWithProgress(retired_translations);
+    if (pipeline_binaries_enabled) {
+        device.GetLogical().DisablePipelineBinaryCache();
+    }
 }
 
 void PipelineCache::NoteDiskRecordFailure(std::string_view kind, u64 hash, const char* reason) {
@@ -2506,7 +2529,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
         RefreshGraphicsKey();
     }
     if (current_pipeline) {
-        GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};
+        GraphicsPipeline* const next{current_pipeline->Next(graphics_key, transition_generation)};
         if (next) {
             current_pipeline = next;
             clean.pipeline = next;
@@ -2560,7 +2583,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     RefreshGraphicsKey();
 
     if (current_pipeline) {
-        GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};
+        GraphicsPipeline* const next{current_pipeline->Next(graphics_key, transition_generation)};
         if (next) {
             current_pipeline = next;
             current_pipeline->MarkUsed(frame_count);
@@ -2800,6 +2823,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         }
     }
 
+    if (pipeline_binaries_enabled) {
+        workers.WaitForRequests();
+        device.GetLogical().DisablePipelineBinaryCache();
+        pipeline_binaries_enabled = false;
+    }
+
     const auto shader_dir{Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir)};
     const auto base_dir{shader_dir / fmt::format("{:016x}", title_id)};
     if (!Common::FS::CreateDir(shader_dir) || !Common::FS::CreateDir(base_dir)) {
@@ -2813,6 +2842,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan-frizti", CACHE_VERSION);
     used_pipelines_filename =
         VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used-frizti", CACHE_VERSION);
+    if (Settings::values.use_vulkan_driver_pipeline_cache.GetValue() &&
+        device.IsKhrPipelineBinarySupported()) {
+        pipeline_binaries_enabled = device.GetLogical().EnablePipelineBinaryCache(
+            VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_binaries-ally", CACHE_VERSION));
+    }
     // This fork's files of an earlier version with the same records (52 before 2026-11-08) are
     // copied to the current version's names, header rewritten, used list and merge log with them.
     // Copied, not renamed: older builds (a rollback to the previous release) keep their cache.
@@ -4119,7 +4153,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         std::ifstream stamp_file(stamp_path, std::ios::binary);
         const std::string previous{std::istreambuf_iterator<char>(stamp_file), {}};
         if (previous == stamp) {
-            if (!keep || LoadKept(kept_path, kept_part, path, kept_stamp, true)) {
+            if (!keep || LoadKept(kept_path, kept_part, path, kept_stamp)) {
                 LOG_INFO(Render_Vulkan, "Precompiled pipelines already prepared for this driver");
                 return;
             }
@@ -4129,12 +4163,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                      "(EDEN_NX2_PRECOMPILED_FAST): preparing them again");
         }
     }
-    // Published again once this preparation has written its file.
-    {
-        std::scoped_lock lock{kept_mutex};
-        kept_index.reset();
-        kept_available = false;
-    }
+    const bool can_write_part = BeginKeptRebuild(path, kept_part, kept_stamp);
 
     // The environment index and where each record starts; records are read again when built.
     std::vector<std::pair<u64, u64>> env_index;
@@ -4228,7 +4257,10 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     // another build) the preparation starts from the first record, so every record is kept.
     PrecompiledKept::Writer writer;
     bool keeping = false;
-    if (keep) {
+    if (keep && !can_write_part) {
+        LOG_INFO(Render_Vulkan, "Precompiled pipelines: warming the driver while the kept "
+                                "staging file serves active readers");
+    } else if (keep) {
         constexpr u64 KeptSpaceNeeded = u64{1536} << 20; // Ocarina of Time: 758 MiB
         const auto space = std::filesystem::space(base_dir, error);
         if (!error && space.available < KeptSpaceNeeded) {
@@ -4454,7 +4486,8 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                             }
                         }
                         skipped = true;
-                    } else if (!keeping && disk_keys && disk_keys->contains(record_key.Hash())) {
+                    } else if (!keeping && can_write_part && disk_keys &&
+                               disk_keys->contains(record_key.Hash())) {
                         ++state.known;
                         skipped = true;
                     }
@@ -4590,13 +4623,6 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     } else if (keeping) {
         const auto totals = writer.GetTotals();
         if (writer.Finish(record_offsets)) {
-            std::filesystem::rename(kept_part, kept_path, error);
-            if (error) {
-                // A pipeline built from the previous file can still hold it open: this one is
-                // read where it is, and moved over it at the next boot (LoadKept).
-                LOG_INFO(Render_Vulkan, "Precompiled pipelines: {} stays {} until the next boot",
-                         kept_path.filename().string(), kept_part.filename().string());
-            }
             LOG_INFO(Render_Vulkan,
                      "Precompiled shader infos and SPIR-V kept for {} pipelines: {} distinct "
                      "infos, {} distinct stages of SPIR-V ({} MiB compressed), {} MiB in all",
@@ -4609,9 +4635,13 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                      state.compute_storage_proven.load(), state.compute_storage.load(),
                      state.compute_programs_proven.load(), state.compute_programs.load(),
                      state.graphics_storage_proven.load(), state.graphics_storage.load());
+            if (!PublishKeptFile(kept_part, path, kept_stamp, false, kept_path)) {
+                return;
+            }
         } else {
             LOG_WARNING(Render_Vulkan, "Precompiled pipelines: writing {} failed",
                         kept_part.filename().string());
+            return;
         }
     }
     if (finished) {
@@ -4619,10 +4649,6 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         stamp_file << stamp;
         stamp_file.close();
         std::filesystem::remove(progress_path, error);
-        if (keeping) {
-            // Written by this build: its translation, nothing to check.
-            LoadKept(kept_path, kept_part, path, kept_stamp, false);
-        }
     }
 }
 
@@ -4676,24 +4702,44 @@ std::shared_ptr<const PrecompiledKept::Index> PipelineCache::KeptIndex() const {
     return kept_index;
 }
 
-bool PipelineCache::LoadKept(const std::filesystem::path& kept, const std::filesystem::path& part,
-                             const std::filesystem::path& precompiled, const std::string& stamp,
-                             bool check) {
-    std::string why;
-    std::shared_ptr<const PrecompiledKept::Index> index;
+bool PipelineCache::BeginKeptRebuild(const std::filesystem::path& precompiled,
+                                     const std::filesystem::path& part, const std::string& stamp) {
+    // A finished .part may still be serving draws if its rename failed. An in-flight
+    // draw can hold the old index even after it is unpublished.
     std::error_code error;
-    std::filesystem::path used = kept;
-    if (std::filesystem::exists(part, error)) {
-        // A finished file the preparation could not move over the previous one (still open
-        // then): moved now. An unfinished one is left for the preparation to resume.
-        if (PrecompiledKept::Index::Load(part, precompiled, stamp, CACHE_VERSION, why)) {
-            std::filesystem::rename(part, kept, error);
-            if (error) {
-                used = part;
-            }
-        }
+    const bool part_exists = std::filesystem::exists(part, error);
+    bool part_may_be_live = kept_file == part || bool(error);
+    if (!part_may_be_live && part_exists && !kept_file.empty()) {
+        part_may_be_live = std::filesystem::equivalent(kept_file, part, error) || bool(error);
     }
-    index = PrecompiledKept::Index::Load(used, precompiled, stamp, CACHE_VERSION, why);
+    std::scoped_lock lock{kept_mutex};
+    if (kept_index && part_may_be_live) {
+        kept_part_reader = kept_index;
+    }
+    if (stamp.empty() || kept_source != precompiled || published_kept_stamp != stamp) {
+        kept_available = false;
+        kept_index.reset();
+    }
+    return kept_part_reader.expired();
+}
+
+bool PipelineCache::LoadKept(const std::filesystem::path& kept, const std::filesystem::path& part,
+                             const std::filesystem::path& precompiled, const std::string& stamp) {
+    std::error_code error;
+    if (std::filesystem::exists(part, error) &&
+        PublishKeptFile(part, precompiled, stamp, true, kept)) {
+        return true;
+    }
+    return PublishKeptFile(kept, precompiled, stamp, true);
+}
+
+bool PipelineCache::PublishKeptFile(const std::filesystem::path& file,
+                                    const std::filesystem::path& precompiled,
+                                    const std::string& stamp, bool check,
+                                    const std::filesystem::path& promote_to) {
+    std::error_code error;
+    std::string why;
+    auto index = PrecompiledKept::Index::Load(file, precompiled, stamp, CACHE_VERSION, why);
     if (!index) {
         LOG_INFO(Render_Vulkan, "Precompiled fast path: no kept infos and SPIR-V to draw from ({})",
                  why);
@@ -4702,12 +4748,24 @@ bool PipelineCache::LoadKept(const std::filesystem::path& kept, const std::files
     // Before the GPU thread can see it: a file written by another build is used only when a
     // sample of it translates the same with this one. One that differs is deleted, so the
     // preparation keeps them again (from its first record) instead of checking it every boot.
-    if (check && !CheckKeptSample(*index, used.filename().string())) {
+    if (check && !CheckKeptSample(*index, file.filename().string())) {
         index.reset();
-        std::filesystem::remove(used, error);
+        std::filesystem::remove(file, error);
         LOG_INFO(Render_Vulkan, "Precompiled fast path: no kept infos and SPIR-V to draw from "
                                 "(they differ from this build's translation)");
         return false;
+    }
+    // Open and validate the replacement before touching the previous cache. PositionalFile
+    // keeps the same file open across a rename, including on Windows.
+    auto used = file;
+    if (!promote_to.empty()) {
+        std::filesystem::rename(file, promote_to, error);
+        if (!error) {
+            used = promote_to;
+        } else {
+            LOG_INFO(Render_Vulkan, "Kept pipelines remain in {} until the next boot: {}",
+                     file.filename().string(), error.message());
+        }
     }
     const u64 file_bytes = std::filesystem::file_size(used, error);
     LOG_INFO(Render_Vulkan,
@@ -4719,6 +4777,9 @@ bool PipelineCache::LoadKept(const std::filesystem::path& kept, const std::files
     {
         std::scoped_lock lock{kept_mutex};
         kept_index = std::move(index);
+        kept_file = used;
+        kept_source = precompiled;
+        published_kept_stamp = stamp;
         kept_available = true;
     }
     return true;
@@ -5685,7 +5746,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
         SaveUsedPipelines();
     }
     if (current_pipeline) {
-        current_pipeline->AddTransition(pipeline.get());
+        current_pipeline->AddTransition(pipeline.get(), transition_generation);
     }
     current_pipeline = pipeline.get();
     current_pipeline->MarkUsed(frame_count);
@@ -5724,6 +5785,10 @@ void ReportWorstFrame() {
         const char* value = std::getenv("EDEN_NX2_PIPELINE_TIMING");
         return value != nullptr && value[0] == '1';
     }();
+    static const bool trace_long_gaps = [] {
+        const char* value = std::getenv("EDEN_NX2_QUERY_WAIT_TRACE");
+        return value && std::string_view{value} == "1";
+    }();
     static std::chrono::steady_clock::time_point last_tick{};
     static std::chrono::steady_clock::time_point window{};
     static std::chrono::nanoseconds last_held{};
@@ -5756,6 +5821,9 @@ void ReportWorstFrame() {
             if (every_slow_frame && logged_slow < 2000) {
                 ++logged_slow;
                 LOG_INFO(Render_Vulkan, "Slow frame: {:.1f} ms; {}", ms(frame.time),
+                         describe(frame));
+            } else if (trace_long_gaps && frame.time >= std::chrono::milliseconds{500}) {
+                LOG_INFO(Render_Vulkan, "Renderer frame gap ended: {:.1f} ms, {}", ms(frame.time),
                          describe(frame));
             }
         }
@@ -5838,8 +5906,12 @@ void PipelineCache::TickFrame() {
     if (device.IsExtGraphicsPipelineLibrarySupported()) {
         graphics_libraries.Report();
     }
-    while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
-        evicted_pipelines.pop_front();
+    // A large eviction can otherwise destroy thousands of driver objects on one frame.
+    // Keep the GPU fence requirement and drain faster when host memory is scarce.
+    if (!evicted_pipelines.empty()) {
+        RetireReadyPipelines(
+            evicted_pipelines, [this](const auto& entry) { return scheduler.IsFree(entry.first); },
+            [] { return std::chrono::steady_clock::now(); }, Common::IsHostLowOnMemory());
     }
     // A retired translation's build may still be queued on the pipeline workers: destroying it
     // now would wait for that build, or run it here on the GPU thread.
@@ -5865,6 +5937,7 @@ void PipelineCache::TickFrame() {
             graphics_libraries.TrimUnused(MaxLibraries);
         }
     }
+    DrainPendingGraphicsEvictions();
 }
 
 PipelineCache::MemoryOwnerCounts PipelineCache::MemoryOwners() {
@@ -5908,6 +5981,9 @@ void PipelineCache::RetireTranslatedPipeline(std::unique_ptr<GraphicsPipeline> p
 }
 
 void PipelineCache::EvictUnusedPipelines() {
+    if (!pending_graphics_evictions.empty()) {
+        return;
+    }
     // Building a pipeline again on MoltenVK means a Metal compile mid-game, far dearer than the
     // 2-3 ms below, so none are evicted there.
     if (device.IsMoltenVK()) {
@@ -5926,6 +6002,7 @@ void PipelineCache::EvictUnusedPipelines() {
     if (frame_count <= EvictAfterFrames) {
         return;
     }
+    VideoCommon::FrameEndTrace::Scope trace{"graphics pipeline eviction selection"};
     // Only while the cache is large: each one evicted is translated again on the GPU thread when
     // its place is revisited (~10 ms). Ocarina of Time kept ~1,900 of them and evicted 3,400 in
     // 25 minutes of play, then rebuilt 1,850 (14 s of stalls, 3.8 s in one 10 s window). The
@@ -5937,6 +6014,8 @@ void PipelineCache::EvictUnusedPipelines() {
     if (graphics_cache.size() <= evict_above) {
         return;
     }
+    // Count resident built objects, not failed/null or pending entries (Lichii PR #1334).
+    size_t built = 0;
     const u64 cutoff = frame_count - EvictAfterFrames;
     // A pipeline built from the disk cache at boot that no draw has used yet stays, up to a budget
     // (from zortos293/Lichii#550): evicting it throws the prebuild away, and the game translates it
@@ -5944,9 +6023,15 @@ void PipelineCache::EvictUnusedPipelines() {
     // memory) they go like the rest, so a large cache can't hold their memory all session.
     constexpr size_t MaxUnusedPrebuiltPipelines = 2000;
     size_t kept_prebuilt = 0;
-    std::vector<std::pair<u64, GraphicsPipelineCacheKey>> candidates;
+    // These references live only during this scan, before any cache mutation. Sort compact
+    // records and copy only the selected keys into the queue that survives this frame.
+    std::vector<std::pair<u64, const GraphicsPipelineCacheKey*>> candidates;
     for (const auto& [key, pipeline] : graphics_cache) {
-        if (pipeline == nullptr || pipeline.get() == current_pipeline || !pipeline->IsBuilt() ||
+        if (pipeline == nullptr || !pipeline->IsBuilt()) {
+            continue;
+        }
+        ++built;
+        if (pipeline.get() == current_pipeline ||
             pipeline->LastUse() >= cutoff) {
             continue;
         }
@@ -5954,32 +6039,64 @@ void PipelineCache::EvictUnusedPipelines() {
             ++kept_prebuilt;
             continue;
         }
-        candidates.emplace_back(pipeline->LastUse(), key);
+        candidates.emplace_back(pipeline->LastUse(), &key);
     }
-    const size_t evicted = VideoCommon::GraphicsPipelinesToEvict(graphics_cache.size(),
-                                                                 candidates.size(), evict_above);
+    const size_t evicted =
+        VideoCommon::GraphicsPipelinesToEvict(built, candidates.size(), evict_above);
     if (evicted == 0) {
         return;
     }
     std::nth_element(candidates.begin(), candidates.begin() + (evicted - 1), candidates.end(),
                      [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
-    const u64 tick = scheduler.CurrentTick();
+    pending_eviction_cutoff = cutoff;
+    pending_eviction_removed = 0;
+    pending_eviction_frames = 0;
     for (size_t i = 0; i < evicted; ++i) {
-        const auto it = graphics_cache.find(candidates[i].second);
-        if (used_this_session.erase(it->second.get()) != 0) {
-            used_and_evicted.insert(it->first.Hash());
-        }
-        evicted_pointer_slots.Remember(it->first.Hash(), it->second->MappedPointers());
-        evicted_pipelines.emplace_back(tick, std::move(it->second));
-        graphics_cache.erase(it);
+        pending_graphics_evictions.emplace_back(candidates[i].first, *candidates[i].second);
     }
-    for (auto& [key, pipeline] : graphics_cache) {
-        if (pipeline) {
-            pipeline->ClearTransitions();
-        }
+    LOG_INFO(Render_Vulkan, "Queued {} unused graphics pipelines for bounded eviction", evicted);
+}
+
+void PipelineCache::DrainPendingGraphicsEvictions() {
+    if (pending_graphics_evictions.empty()) {
+        return;
     }
-    LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines unused for {} frames, {} left", evicted,
-             EvictAfterFrames, graphics_cache.size());
+    VideoCommon::FrameEndTrace::Scope trace{"graphics pipeline eviction removal"};
+    const u64 tick = scheduler.CurrentTick();
+    bool invalidated_transitions = false;
+    pending_eviction_removed += DrainPipelineEvictions(
+        pending_graphics_evictions,
+        [&](const auto& candidate) {
+            const auto it = graphics_cache.find(candidate.second);
+            if (it == graphics_cache.end() || !it->second) {
+                return false;
+            }
+            const auto* pipeline = it->second.get();
+            // A draw may have reused this key since selection. Never carry map iterators or
+            // assume the selected object is still cold on a later frame.
+            if (pipeline == current_pipeline || pipeline == clean.pipeline || !pipeline->IsBuilt() ||
+                pipeline->LastUse() != candidate.first ||
+                pipeline->LastUse() >= pending_eviction_cutoff) {
+                return false;
+            }
+            if (!invalidated_transitions) {
+                ++transition_generation;
+                invalidated_transitions = true;
+            }
+            if (used_this_session.erase(pipeline) != 0) {
+                used_and_evicted.insert(it->first.Hash());
+            }
+            evicted_pointer_slots.Remember(it->first.Hash(), pipeline->MappedPointers());
+            evicted_pipelines.emplace_back(tick, std::move(it->second));
+            graphics_cache.erase(it);
+            return true;
+        },
+        [] { return std::chrono::steady_clock::now(); }, Common::IsHostLowOnMemory());
+    ++pending_eviction_frames;
+    if (pending_graphics_evictions.empty()) {
+        LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines across {} frame batches, {} left",
+                 pending_eviction_removed, pending_eviction_frames, graphics_cache.size());
+    }
 }
 
 void PipelineCache::EvictUnusedComputePipelines(int mode) {

@@ -26,12 +26,14 @@ class Scheduler {
 public:
     void Push(GPU& gpu, s32 channel, CommandList&& entries);
 
-    /// Runs channels whose pending semaphore acquire is now met.
+    /// Complete submitted command-list reads before a later host operation, e.g. a GPU map.
+    void FinishPendingListReads(GPU& gpu);
+    /// Runs channels whose pending acquire or command-list copy is ready.
     void ResumePending(GPU& gpu);
     [[nodiscard]] bool HasPendingChannels() const {
         return !pending_channels.empty();
     }
-    /// HasPendingChannels for threads other than the GPU thread.
+    /// Guest semaphore suspensions only: the presentation thread may skip its wait for these.
     [[nodiscard]] bool HasPendingChannelsAnyThread() const {
         return any_pending.load(std::memory_order_acquire);
     }
@@ -40,6 +42,7 @@ public:
 
 private:
     void BindChannel(GPU& gpu, s32 bind_id);
+    void RefreshPendingChannels();
 
     ::Common::unordered_map<s32, std::shared_ptr<ChannelState>> channels;
     std::mutex scheduling_guard;

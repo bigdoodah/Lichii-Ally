@@ -2278,7 +2278,8 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
                 tr("Use the recommended settings for Mario Kart World?\n\n"
                    "Vulkan, 1x resolution, GPU Fast, asynchronous shaders, BC3, conservative VRAM, "
                    "reactive flushing off, FIFO Relaxed VSync, handheld mode, ScaleForce, and "
-                   "FXAA.\n\n"
+                   "FXAA. The preset uses 30 FPS unless you selected a different per-game "
+                   "frame mode. If both modes are selected, it uses 30 FPS.\n\n"
                    "They apply to Mario Kart World until Lichii is closed. Your saved settings "
                    "are not changed."),
                 QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes;
@@ -2288,7 +2289,10 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
                                           use_recommended_mkw_settings)) {
         QtCommon::system->ApplySettings();
         Settings::UpdateGPUAccuracy();
-        LOG_INFO(Config, "Applied recommended MKW settings after per-game configuration");
+        LOG_INFO(Config,
+                 "Applied recommended MKW settings after per-game configuration: "
+                 "30 FPS={}, dynamic FPS={}",
+                 Settings::values.mkw_30fps.GetValue(), Settings::values.mkw_dynamic_fps.GetValue());
     }
     Settings::LogSettings();
 

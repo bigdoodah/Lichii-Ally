@@ -33,6 +33,7 @@
 #include "common/dkb_frame_trace.h"
 #include "common/game_presets.h"
 #include "common/settings.h"
+#include "common/memory_detect.h"
 #include "common/thread.h"
 #include "core/core.h"
 #include "core/arm/dynarmic/window_trace.h"
@@ -1474,8 +1475,12 @@ private:
     // Every 30 s: the backing of sparse blocks and GPU-only regions is marked cold. The game
     // writes it once (texture uploads by 2D blits: title 1 fills 2-4 GB of texture pools) and it
     // is read again only when the texture cache builds an image over it, so the OS may compress or
-    // page it out before anything else. Last member: stops before the regions are destroyed.
+    // page it out before anything else. Only while the host is short of RAM, as for uploads
+    // (DeviceMemoryManager::HintCold). Last member: stops before the regions are destroyed.
     void HintColdBacking() {
+        if (!Common::IsHostLowOnMemory()) {
+            return;
+        }
         struct Range {
             u64 physical_offset;
             u64 virtual_address;
@@ -4353,16 +4358,21 @@ private:
     }
 
     // Mirrors Eden's guest syncpoint values into the shared RO page. Returns true if any changed.
-    bool UpdateSyncptValues() {
+    bool UpdateSyncptValues(std::array<u64, 0x40>* changed_ids = nullptr) {
         auto& manager = system.Host1x().GetSyncpointManager();
         bool changed = false;
         for (u32 id = 0; id < std::min(m_syncpt_count, HostSyncpoints); ++id) {
-            const u64 value = manager.GetGuestSyncpointValue(id);
+            const u32 value = manager.GetGuestSyncpointValue(id);
             const u64 address = m_syncpt_ro + SyncptValuesOffset + id * 8;
             if (m_syncpt_memory->Read64(address) != value) {
                 m_syncpt_memory->Write64(address, value);
                 changed = true;
             }
+            if (changed_ids != nullptr && id / 64 < changed_ids->size() &&
+                m_syncpt_polled_values[id] != value) {
+                (*changed_ids)[id / 64] |= u64{1} << (id % 64);
+            }
+            m_syncpt_polled_values[id] = value;
         }
         return changed;
     }
@@ -4388,12 +4398,17 @@ private:
         for (u32 w = 0; w < words; ++w) {
             armed[w] = m_syncpt_memory->Read64(m_syncpt_rw + SyncptRwBitsOffset + w * 8);
         }
-        UpdateSyncptValues();
+        // Preserve advances even when the client's armed bit is unchanged (Lichii #2052).
+        std::array<u64, 0x40> changed_ids{};
+        UpdateSyncptValues(&changed_ids);
         bool acked = false;
         for (u32 w = 0; w < words; ++w) {
             const u64 ro_address = m_syncpt_ro + SyncptRoBitsOffset + w * 8;
             if (m_syncpt_memory->Read64(ro_address) != armed[w]) {
                 m_syncpt_memory->Write64(ro_address, armed[w]);
+                acked = true;
+            }
+            if (w < changed_ids.size() && (armed[w] & changed_ids[w]) != 0) {
                 acked = true;
             }
         }
@@ -4844,6 +4859,7 @@ private:
     u64 m_syncpt_rw{};
     u64 m_syncpt_ro{};
     u32 m_syncpt_count{};
+    std::array<u32, HostSyncpoints> m_syncpt_polled_values{};
     std::shared_ptr<Core::Timing::EventType> m_syncpt_poll;
     /// EDEN_NX2_EXP37: PollSyncpts at once after a guest syncpoint increment (OnGuestIncrement),
     /// at most one pending.

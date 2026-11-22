@@ -39,6 +39,26 @@
 
 namespace Vulkan {
 
+bool TextureWaitTraceEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_TEXTURE_WAIT_TRACE");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+void ReportSlowTextureWait(const char* site, double milliseconds, u64 tick) {
+    if (milliseconds < 100.0) {
+        return;
+    }
+    static std::atomic<u32> reports{};
+    if (reports.fetch_add(1, std::memory_order_relaxed) < 256) {
+        LOG_WARNING(Render_Vulkan,
+                    "Slow scheduler wait: {} {:.2f} ms, tick {}; CPU wall time, not GPU duration",
+                    site, milliseconds, tick);
+    }
+}
+
 namespace {
 std::atomic<u64> g_profile_submits{};
 std::atomic<u64> g_profile_renderpasses{};
@@ -128,7 +148,7 @@ void ReportSubmitCounts() {
                  static_cast<double>(ends[i].first) / seconds, ends[i].second);
     }
 }
-}
+} // namespace
 
 void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,
                                          vk::CommandBuffer upload_cmdbuf) {
@@ -321,6 +341,9 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
 }
 
 void Scheduler::WaitWorker() {
+    const bool trace_texture_wait = TextureWaitTraceEnabled();
+    const auto worker_wait_start = trace_texture_wait ? std::chrono::steady_clock::now()
+                                                      : std::chrono::steady_clock::time_point{};
     DispatchWork();
 
     // Waits for the Vulkan worker (tools/nx2/critical_path.py's table): the queue, then the
@@ -333,7 +356,16 @@ void Scheduler::WaitWorker() {
     }
 
     // Now wait for execution to finish.
-    std::scoped_lock el{execution_mutex};
+    {
+        std::scoped_lock el{execution_mutex};
+    }
+    if (trace_texture_wait) {
+        ReportSlowTextureWait("Vulkan worker drain",
+                              std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - worker_wait_start)
+                                  .count(),
+                              0);
+    }
 }
 
 void Scheduler::MarkFrameEnd(u64 frame) {

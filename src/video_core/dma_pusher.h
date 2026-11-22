@@ -22,6 +22,7 @@
 #include "common/scratch_buffer.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/puller.h"
+#include "video_core/pending_list_copy.h"
 
 namespace Core {
 class System;
@@ -170,15 +171,17 @@ public:
         dma_pushbuffer.push_back(std::move(entries));
     }
 
-    void DispatchCalls();
+    void DispatchCalls(bool allow_list_yield = true);
+    [[nodiscard]] bool HasPendingListRead() const { return pending_list_copy.tick != 0; }
+    void WaitForPendingListRead();
 
-    /// Switch 2: true while the channel is suspended on a semaphore acquire.
     [[nodiscard]] bool HasPendingAcquire() const {
         return puller.HasPendingAcquire();
     }
-    [[nodiscard]] bool CanResumeAcquire() {
-        return puller.CanResumeAcquire(*this);
+    [[nodiscard]] bool IsSuspended() const {
+        return HasPendingListRead() || HasPendingAcquire();
     }
+    [[nodiscard]] bool CanResumeAcquire();
 
     void BindSubchannel(Engines::EngineInterface* engine, u32 subchannel_id, Engines::EngineTypes engine_type) {
         subchannels[subchannel_id] = engine;
@@ -190,7 +193,10 @@ public:
 private:
     static constexpr u32 non_puller_methods = 0x40;
     static constexpr u32 max_subchannels = 8;
-    bool Step();
+    bool Step(bool allow_list_yield);
+    PendingListCopy pending_list_copy{};
+    std::chrono::steady_clock::time_point list_wait_start{};
+    bool holds_host_requests{};
     /// Returns how many words were processed: fewer than given when a semaphore acquire
     /// suspended the channel.
     size_t ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset = 0);
@@ -230,7 +236,8 @@ public:
     /// buffer cache made after the work that wrote them or from guest memory for pages flushed
     /// since. False when not all are current (or the list isn't GPU-written): the caller drains,
     /// flushes and reads guest memory.
-    bool ReadGpuWrittenCommands(GPUVAddr address, u32 count);
+    bool ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool allow_list_yield,
+                                const PendingListCopy& previous);
     /// EDEN_NX2_LIST_VERIFY: reads the list ReadGpuWrittenCommands just read again as before
     /// EXP40 (Nx2ListVerify) and leaves the words read last in command_headers.
     void VerifyGpuWrittenCommands(GPUVAddr address, u32 count);

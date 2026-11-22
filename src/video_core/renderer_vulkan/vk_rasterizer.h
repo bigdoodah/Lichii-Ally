@@ -110,7 +110,11 @@ public:
     void FlushRegionForRead(DAddr addr, u64 size) override;
     void FinishRead(DAddr addr, u64 size) override;
     GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out,
-                                             bool past_sync) override;
+                                             bool past_sync, Tegra::PendingListCopy* pending) override;
+    bool IsListTickDone(u64 tick) override;
+    void WaitForListTick(u64 tick) override;
+    void TraceSuspendedListWait(u64 tick, u64 writer, std::chrono::steady_clock::time_point start,
+                                std::chrono::steady_clock::time_point observed) override;
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
     void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) override;
     bool MustFlushRegion(DAddr addr, u64 size,

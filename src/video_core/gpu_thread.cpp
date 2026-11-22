@@ -107,6 +107,10 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 break;
             }
             last_progress = std::chrono::steady_clock::now();
+            if (scheduler.HasPendingChannels() &&
+                !std::holds_alternative<SubmitListCommand>(next.data)) {
+                scheduler.FinishPendingListReads(system.GPU());
+            }
             if (split.Active()) {
                 // Only command lists are parsed here; everything else runs on the back thread
                 // in order, and so does the signal that the command ran.

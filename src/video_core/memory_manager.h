@@ -153,6 +153,9 @@ public:
     /// WriteBlockCached of `count` consecutive words within one device page, in a single write.
     void WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, std::size_t count);
 
+    /// Cached translation for writes contained in one backed device page.
+    bool TryWriteCachedPage(GPUVAddr gpu_dest_addr, const void* data, std::size_t size);
+
     /**
      * Checks if a gpu region can be simply read with a pointer.
      */

@@ -179,6 +179,11 @@ public:
 
     void WaitForIdle();
 
+    // Split-back markers around a suspended command list; intervening draws may not
+    // consume host idle/read requests ahead of the remainder of the list.
+    void BeginListCopyWait();
+    void EndListCopyWait();
+
     /// Tick pending requests within the GPU.
     void TickWork();
 

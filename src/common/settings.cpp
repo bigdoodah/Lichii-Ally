@@ -272,14 +272,14 @@ bool IsNceEnabled() {
     return is_nce_enabled;
 }
 
-static u64 current_program_id = 0;
+static std::atomic<u64> current_program_id{};
 
 void SetCurrentProgramID(u64 program_id) {
-    current_program_id = program_id;
+    current_program_id.store(program_id, std::memory_order_relaxed);
 }
 
 u64 GetCurrentProgramID() {
-    return current_program_id;
+    return current_program_id.load(std::memory_order_relaxed);
 }
 
 static bool current_program_is_switch2 = false;

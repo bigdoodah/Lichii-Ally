@@ -376,11 +376,15 @@ private:
     /// TickFrame: the fast path's counts of the last 10 s.
     void ReportPrecompiled();
     /// Publishes the kept file's index for the GPU thread (`kept`, or a finished `part` the
-    /// preparation could not rename over it); false when there is none for `stamp`. With
-    /// `check` (a file another build may have written) it is published only when
-    /// CheckKeptSample finds it equal, and deleted otherwise.
+    /// preparation could not rename over it) if its stamp and sampled translations match.
     bool LoadKept(const std::filesystem::path& kept, const std::filesystem::path& part,
-                  const std::filesystem::path& precompiled, const std::string& stamp, bool check);
+                  const std::filesystem::path& precompiled, const std::string& stamp);
+    bool PublishKeptFile(const std::filesystem::path& file, const std::filesystem::path& precompiled,
+                         const std::string& stamp, bool check,
+                         const std::filesystem::path& promote_to = {});
+    /// Returns whether the writer may modify part without affecting a live reader.
+    bool BeginKeptRebuild(const std::filesystem::path& precompiled, const std::filesystem::path& part,
+                          const std::string& stamp);
     /// The boot check of a kept file: a sample of its pipelines (64 graphics, up to 16 compute,
     /// spread over the index) translated again from their recorded environments with this build
     /// and its settings, and compared with the kept SPIR-V and infos. True when all are equal.
@@ -394,6 +398,9 @@ private:
     /// Set by LoadKept; read by the GPU thread when a new key is looked up.
     mutable std::mutex kept_mutex;
     std::shared_ptr<const PrecompiledKept::Index> kept_index;
+    std::filesystem::path kept_source, kept_file;
+    std::string published_kept_stamp;
+    std::weak_ptr<const PrecompiledKept::Index> kept_part_reader;
     std::atomic<bool> kept_available{};
     /// GPU thread: keys whose precompiled build failed or whose audit differed.
     std::unordered_set<u64> precompiled_rejected;
@@ -557,6 +564,7 @@ private:
     VideoCore::ShaderNotify& shader_notify;
     bool use_asynchronous_shaders{};
     bool use_vulkan_pipeline_cache{};
+    bool pipeline_binaries_enabled{};
     bool oot_visual_workaround{};
     u64 visual_workaround_title{};
     const size_t num_pipeline_workers;
@@ -568,6 +576,7 @@ private:
     GraphicsPipelineCacheKey graphics_key{};
     u64 vertex_attribute_types{}; ///< graphics_key's attribute types before the programs' mask
     GraphicsPipeline* current_pipeline{};
+    u64 transition_generation{};
 
     /// EDEN_NX2_GPL: shader libraries shared by the graphics pipelines. Declared before the
     /// pipelines, so it outlives them.
@@ -575,6 +584,11 @@ private:
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
+    void DrainPendingGraphicsEvictions();
+    std::deque<std::pair<u64, GraphicsPipelineCacheKey>> pending_graphics_evictions;
+    u64 pending_eviction_cutoff{};
+    size_t pending_eviction_removed{};
+    size_t pending_eviction_frames{};
     u64 frame_count{};
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
     /// Pipelines the translate queue did not use (discarded, stale, abandoned, rejected by the

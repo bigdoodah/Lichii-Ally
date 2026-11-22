@@ -8,6 +8,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/nx2.h"
+#include "video_core/query_dma_report_range.h"
 
 TEST_CASE("Nx2WaitAsyncReportsSettled returns at once without pending reports",
           "[video_core][nx2]") {
@@ -94,4 +95,33 @@ TEST_CASE("Nx2WaitAsyncReportsSettled ignores reports outside the range", "[vide
     Tegra::Nx2WaitAsyncReportsSettled(address, 0x10);
     REQUIRE_FALSE(Tegra::Nx2AsyncReportsSettled(address + 0x100, 0x10));
     Tegra::Nx2CompleteAsyncReport(address + 0x100);
+}
+
+TEST_CASE("DMA reads wait for a report tail even when the cache reports no dirty value",
+          "[video_core][nx2]") {
+    using VideoCommon::QueryDma::ReportReadRange;
+    constexpr u64 page = 0x70'1000;
+    Tegra::Nx2AsyncReport report{page - 4};
+    report.Issue();
+    // Four possible word reads, including the timestamp and the next device page.
+    for (u64 byte = page - 4; byte < page + 12; ++byte) {
+        const auto range = ReportReadRange::FromRead(byte, 1);
+        REQUIRE(range.NeedsFence(false, true));
+        REQUIRE_FALSE(range.NeedsFence(false, false));
+    }
+    auto timestamp = ReportReadRange::FromRead(page + 4, 8);
+    REQUIRE_FALSE(ReportReadRange::FromRead(page + 0x40, 4).NeedsFence(false, true));
+    report.Complete();
+    REQUIRE_FALSE(timestamp.NeedsFence(false, true));
+    REQUIRE(timestamp.NeedsFence(true, true));
+    REQUIRE(timestamp.NeedsFence(true, false));
+}
+
+TEST_CASE("DMA report lookbehind respects address zero and empty reads", "[video_core][nx2]") {
+    using VideoCommon::QueryDma::ReportReadRange;
+    constexpr auto low = ReportReadRange::FromRead(3, 4);
+    REQUIRE(low.begin == 0);
+    REQUIRE(low.size == 7);
+    constexpr auto empty = ReportReadRange::FromRead(3, 0);
+    REQUIRE(empty.size == 0);
 }

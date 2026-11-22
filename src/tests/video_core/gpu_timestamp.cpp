@@ -32,6 +32,20 @@ Timing At(u64 ns) {
 
 } // namespace
 
+TEST_CASE("Only Mario Kart World uses GPU tick reports on Ampere", "[video_core][gpu_timestamp]") {
+    constexpr u64 MarioKartWorld = 0x0400C3F00006E000ULL;
+    constexpr u64 OcarinaOfTime = 0x0400486024DEC000ULL;
+    const auto timing = At(1'000'000);
+    constexpr u64 PresentNs = 800'000;
+    const auto timestamp = [&](u64 program_id) {
+        return Tegra::ReadGpuTimestamp(timing, !Tegra::UsesLegacyAmpereTimestamps(program_id),
+                                       Settings::GpuClock::Boost, PresentNs);
+    };
+    REQUIRE(timestamp(MarioKartWorld) == timing.gpu_ticks / 256);
+    REQUIRE(timestamp(OcarinaOfTime) == 850'000);
+    REQUIRE(timestamp(0) == 850'000);
+}
+
 TEST_CASE("Ampere report timestamps use driver and VI nanoseconds", "[video_core][gpu_timestamp]") {
     constexpr u64 HostTimeNs = 293'036'000'000'000;
     for (const auto clock : Clocks) {

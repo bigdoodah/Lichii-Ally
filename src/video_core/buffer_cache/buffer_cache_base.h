@@ -28,6 +28,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/common_types.h"
+#include "video_core/pending_list_copy.h"
 #include "common/spin_recursive_mutex.h"
 #include "common/div_ceil.h"
 #include "common/literals.h"
@@ -430,7 +431,7 @@ public:
     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
     /// `writer`: the dispatch's shader hash, 0 for a DMA copy (EDEN_NX2_LIST_WAIT_TRACE).
     bool Nx2CopyListPages(u64 tick, u64 writer = 0);
-    enum class Nx2ListRead { Unknown, Copied, Synced, NeedsSync };
+    enum class Nx2ListRead { Unknown, Copied, Synced, NeedsSync, Pending };
     /// Front thread: Synced when guest memory holds the page `device_addr` lies in (flushed and
     /// written by no GPU work since), else Copied with `out` filled from the copy of its last
     /// write once the GPU is done with it. Unknown otherwise: the caller drains and flushes.
@@ -440,7 +441,8 @@ public:
     /// [device_addr, device_addr + out.size()) since the page was flushed, or the host wrote them
     /// since; Copied reads the words GPU work wrote from the copy and, once the page was flushed,
     /// the others from guest memory.
-    Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync);
+    Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync,
+                                Tegra::PendingListCopy* pending = nullptr);
     /// Front thread, the split drained: the command list page was flushed to guest memory.
     void Nx2NoteListSynced(DAddr page);
     /// The split's back, the front waiting on it: downloads `pages` and every page draws wrote

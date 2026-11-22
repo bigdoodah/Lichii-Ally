@@ -14,7 +14,9 @@
 #include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/buffer_cache/usage_tracker.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/renderer_vulkan/list_tick_poll.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
+#include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -121,7 +123,10 @@ public:
         return (vertex_repack_mask & (1U << binding)) != 0;
     }
 
-    u64 CurrentTick();
+    /// Small uniform buffer binds read this tick on every reuse check.
+    u64 CurrentTick() const noexcept {
+        return master_semaphore.CurrentTick();
+    }
 
     bool IsFree(u64 tick);
 
@@ -143,6 +148,8 @@ public:
     /// Whether the host GPU completed `tick`, asking it when the tick is submitted but not known
     /// to be done.
     [[nodiscard]] bool IsFreeNow(u64 tick);
+    /// Front-thread query shared by initial command-list reads and pending-channel retries.
+    [[nodiscard]] bool IsListTickDone(u64 tick);
 
     u64 GetDeviceLocalMemory() const;
 
@@ -314,6 +321,8 @@ private:
     const Device& device;
     MemoryAllocator& memory_allocator;
     Scheduler& scheduler;
+    const MasterSemaphore& master_semaphore;
+    ListTickPoll list_tick_poll;
     StagingBufferPool& staging_pool;
     GuestDescriptorQueue& guest_descriptor_queue;
 

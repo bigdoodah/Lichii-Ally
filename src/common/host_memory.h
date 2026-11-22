@@ -70,6 +70,8 @@ public:
 
     /// Bytes ClearBackingRegion has filled with zeros (memset) since start.
     static u64 ZeroFilledBytes() noexcept;
+    /// Bytes covered by mapping, unmapping and protection changes.
+    static u64 MappedBytes() noexcept;
 
     /// Guest pages in this process's working set, from QueryWorkingSetEx on every stride-th 4 KiB
     /// page (scaled back up): through the backing, through the guest's views of it, and view

@@ -118,7 +118,7 @@ public:
 
 private:
     /// Builds the pipeline once, on whichever thread gets here first.
-    void RunBuild();
+    bool RunBuild();
 
     const Device& device;
     vk::PipelineCache& pipeline_cache;

@@ -385,7 +385,8 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
                                        ComputePassDescriptorQueue& compute_pass_descriptor_queue,
                                        DescriptorPool& descriptor_pool)
     : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
-      staging_pool{staging_pool_}, guest_descriptor_queue{guest_descriptor_queue_},
+      master_semaphore{scheduler_.GetMasterSemaphore()}, staging_pool{staging_pool_},
+      guest_descriptor_queue{guest_descriptor_queue_},
       quad_index_pass(device, scheduler, descriptor_pool, staging_pool,
                       compute_pass_descriptor_queue),
       multi_range_buffers(device_) {
@@ -477,10 +478,6 @@ void BufferCacheRuntime::TickFrame(Common::SlotVector<Buffer>& slot_buffers) noe
     }
 }
 
-u64 BufferCacheRuntime::CurrentTick() {
-    return scheduler.CurrentTick();
-}
-
 bool BufferCacheRuntime::IsFree(u64 tick) {
     return scheduler.IsFree(tick);
 }
@@ -568,8 +565,11 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick, u64 writer) {
         const bool unsubmitted = !scheduler.IsSubmitted(tick);
         const auto start = std::chrono::steady_clock::now();
         WaitSubmittedTickImpl(tick);
-        trace->Note(writer, tick > known ? tick - known : 0, unsubmitted,
-                    std::chrono::steady_clock::now() - start);
+        const auto observed = std::chrono::steady_clock::now();
+        if (observed - start >= std::chrono::milliseconds{100}) {
+            master.ReportListSubmitWait(tick, writer, start, observed, "blocking");
+        }
+        trace->Note(writer, tick > known ? tick - known : 0, unsubmitted, observed - start);
         return;
     }
     WaitSubmittedTickImpl(tick);
@@ -621,6 +621,16 @@ void BufferCacheRuntime::WaitForHostRead(u64 tick) {
         }
     }
     master.Wait(tick);
+}
+
+bool BufferCacheRuntime::IsListTickDone(u64 tick) {
+    if (scheduler.IsFree(tick)) {
+        return true;
+    }
+    if (list_tick_poll.ShouldRefresh(std::chrono::steady_clock::now())) {
+        scheduler.GetMasterSemaphore().Refresh();
+    }
+    return scheduler.IsFree(tick);
 }
 
 bool BufferCacheRuntime::IsFreeNow(u64 tick) {

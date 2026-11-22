@@ -706,8 +706,57 @@ void MemoryManager::WriteBlockUnsafe(GPUVAddr gpu_dest_addr, const void* src_buf
 }
 
 void MemoryManager::WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size) {
-    WriteBlockImpl(gpu_dest_addr, src_buffer, size, VideoCommon::CacheType::None, true);
+    if (!TryWriteCachedPage(gpu_dest_addr, src_buffer, size)) {
+        WriteBlockImpl(gpu_dest_addr, src_buffer, size, VideoCommon::CacheType::None, true);
+    }
     accumulator.Add(gpu_dest_addr, size);
+}
+
+bool MemoryManager::TryWriteCachedPage(GPUVAddr addr, const void* data, std::size_t size) {
+    constexpr u64 mask = (u64{1} << cpu_page_bits) - 1;
+    if (size == 0 || !IsWithinGPUAddressRange(addr) ||
+        size > address_space_size - addr || size > mask + 1 - (addr & mask) ||
+        OverlapsNativeSyncpointShim(addr, size)) {
+        return false;
+    }
+    // Sparse backing has write side effects and must take the original path even on a hit.
+    if (addr + size > Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) &&
+        addr < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    struct Page {
+        bool valid{};
+        size_t owner{};
+        u64 map_generation{};
+        u64 device_generation{};
+        GPUVAddr address{};
+        DAddr device{};
+        u8* host{};
+    };
+    thread_local Page page;
+    const GPUVAddr base = addr & ~mask;
+    const u64 map_generation = MapSerial();
+    const u64 device_generation = memory.TranslationGeneration();
+    if (!page.valid || page.owner != unique_identifier || page.address != base ||
+        page.map_generation != map_generation || page.device_generation != device_generation) {
+        page.valid = false;
+        const auto device = GpuToCpuAddress(base);
+        if (!device) {
+            return false;
+        }
+        u8* const host = memory.GetPointer<u8>(*device);
+        if (host == nullptr) {
+            return false;
+        }
+        page = {true, unique_identifier, map_generation, device_generation, base, *device, host};
+    }
+    const auto offset = addr & mask;
+    if (VideoCore::g_read_downloads.load(std::memory_order_relaxed) != 0 &&
+        rasterizer != nullptr && VideoCore::ReadDownloadsMayCover(page.device + offset, size)) {
+        rasterizer->FinishRead(page.device + offset, size);
+    }
+    std::memcpy(page.host + offset, data, size);
+    return true;
 }
 
 void MemoryManager::WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, std::size_t count) {
@@ -720,7 +769,9 @@ void MemoryManager::WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, s
         }
         return;
     }
-    WriteBlockImpl(gpu_dest_addr, words, size, VideoCommon::CacheType::None, true);
+    if (!TryWriteCachedPage(gpu_dest_addr, words, size)) {
+        WriteBlockImpl(gpu_dest_addr, words, size, VideoCommon::CacheType::None, true);
+    }
     // The accumulator merges word by word differently from one range: keep its ranges.
     for (std::size_t i = 0; i < count; ++i) {
         accumulator.Add(gpu_dest_addr + i * sizeof(u32), sizeof(u32));

@@ -355,12 +355,22 @@ public:
         }
         const size_t virtual_end = virtual_offset + length;
 
+        // Nearly every call protects a range inside one mapped view, which VirtualProtect does
+        // whole without the lock. It refuses a range that reaches a placeholder or a second view
+        // (one Map or Unmap is making or taking apart, or a range across views): those take the
+        // lock below, which gives the whole range the same flags. Map and Unmap hold the lock
+        // across their kernel calls, which slow down when a game maps memory in bulk (zone
+        // changes): write-trap protections, thousands a second, then queued behind them.
+        DWORD old_flags{};
+        if (VirtualProtect(virtual_base + virtual_offset, length, new_flags, &old_flags)) {
+            return;
+        }
+
         std::scoped_lock lock{placeholder_mutex};
         auto [it, end] = placeholders.equal_range({virtual_offset, virtual_end});
         while (it != end) {
             const size_t offset = (std::max)(it->lower(), virtual_offset);
             const size_t protect_length = (std::min)(it->upper(), virtual_end) - offset;
-            DWORD old_flags{};
             if (!VirtualProtect(virtual_base + offset, protect_length, new_flags, &old_flags)) {
                 LOG_CRITICAL(HW_Memory, "Failed to change virtual memory protect rules");
             }
@@ -1118,6 +1128,14 @@ HostMemory::HostMemory(HostMemory&&) noexcept = default;
 
 HostMemory& HostMemory::operator=(HostMemory&&) noexcept = default;
 
+namespace {
+std::atomic<u64> g_mapped_bytes{};
+}
+
+u64 HostMemory::MappedBytes() noexcept {
+    return g_mapped_bytes.load(std::memory_order_relaxed);
+}
+
 void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms, bool separate_heap) {
 #if !(defined(__OPENORBIS__) || defined(__managarm__))
     ASSERT(virtual_offset % PageAlignment == 0);
@@ -1132,6 +1150,7 @@ void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, M
         // Pages the kernel handed out are committed already; this covers any it did not.
         Commit(host_offset, length);
     }
+    g_mapped_bytes.fetch_add(length, std::memory_order_relaxed);
     impl->Map(virtual_offset + virtual_base_offset, host_offset, length, perms);
 #endif
 }
@@ -1144,6 +1163,7 @@ void HostMemory::Unmap(size_t virtual_offset, size_t length, bool separate_heap)
     if (length == 0 || !virtual_base || !impl) {
         return;
     }
+    g_mapped_bytes.fetch_add(length, std::memory_order_relaxed);
     impl->Unmap(virtual_offset + virtual_base_offset, length);
 #endif
 }
@@ -1159,6 +1179,7 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
     const bool read = True(perm & MemoryPermission::Read);
     const bool write = True(perm & MemoryPermission::Write);
     const bool execute = True(perm & MemoryPermission::Execute);
+    g_mapped_bytes.fetch_add(length, std::memory_order_relaxed);
     impl->Protect(virtual_offset + virtual_base_offset, length, read, write, execute);
 #endif
 }

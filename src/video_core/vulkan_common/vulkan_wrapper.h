@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <filesystem>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -346,6 +347,11 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkGetMemoryWin32HandleKHR vkGetMemoryWin32HandleKHR{};
 #endif
     PFN_vkGetPipelineExecutablePropertiesKHR vkGetPipelineExecutablePropertiesKHR{};
+    PFN_vkGetPipelineKeyKHR vkGetPipelineKeyKHR{};
+    PFN_vkCreatePipelineBinariesKHR vkCreatePipelineBinariesKHR{};
+    PFN_vkDestroyPipelineBinaryKHR vkDestroyPipelineBinaryKHR{};
+    PFN_vkGetPipelineBinaryDataKHR vkGetPipelineBinaryDataKHR{};
+    PFN_vkReleaseCapturedPipelineDataKHR vkReleaseCapturedPipelineDataKHR{};
     PFN_vkWaitForPresentKHR vkWaitForPresentKHR{};
     PFN_vkGetPipelineExecutableStatisticsKHR vkGetPipelineExecutableStatisticsKHR{};
     PFN_vkGetQueryPoolResults vkGetQueryPoolResults{};
@@ -1067,6 +1073,9 @@ class Device : public Handle<VkDevice, NoOwner, DeviceDispatch> {
     using Handle<VkDevice, NoOwner, DeviceDispatch>::Handle;
 
 public:
+    bool EnablePipelineBinaryCache(const std::filesystem::path& file) const;
+    void DisablePipelineBinaryCache() const;
+
     [[nodiscard]] static Device Create(VkPhysicalDevice physical_device,
                                        Span<VkDeviceQueueCreateInfo> queues_ci,
                                        Span<const char*> enabled_extensions, const void* next,

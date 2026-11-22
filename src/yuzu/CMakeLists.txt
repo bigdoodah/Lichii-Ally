@@ -300,6 +300,9 @@ file(GLOB_RECURSE THEMES ${PROJECT_SOURCE_DIR}/dist/qt_themes/*)
 if (ENABLE_UPDATE_CHECKER)
     target_compile_definitions(yuzu PUBLIC ENABLE_UPDATE_CHECKER)
 endif()
+if (LICHII_ALLYX_Z1E)
+    set_property(SOURCE main.cpp APPEND PROPERTY COMPILE_DEFINITIONS LICHII_ALLYX_Z1E)
+endif()
 # fritchii/ includes ui_main.h, which AutoUic already generates for main_window.cpp.
 set_source_files_properties(fritchii/fritchii_ui.cpp fritchii/main_window_fritchii.cpp
     PROPERTIES SKIP_AUTOUIC ON)

@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -38,11 +39,14 @@ class StatefulThreadWorker {
 
 public:
     explicit StatefulThreadWorker(size_t num_workers, std::string name, StateMaker func = {},
-                                  ThreadPlacement placement = ThreadPlacement::Default)
+                                  ThreadPlacement placement = ThreadPlacement::Default,
+                                  std::optional<ThreadPriority> priority = std::nullopt)
         : workers_queued{num_workers}, thread_name{std::move(name)} {
-        const auto lambda = [this, func, placement](std::stop_token stop_token) {
+        const auto lambda = [this, func, placement, priority](std::stop_token stop_token) {
             Common::SetCurrentThreadName(thread_name.c_str());
-            if (placement != ThreadPlacement::Default) {
+            if (priority) {
+                Common::SetCurrentThreadPriority(*priority);
+            } else if (placement != ThreadPlacement::Default) {
                 Common::SetCurrentThreadPriority(ThreadPriority::Low);
             }
             switch (placement) {

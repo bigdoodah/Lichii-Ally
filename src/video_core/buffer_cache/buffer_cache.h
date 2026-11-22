@@ -28,6 +28,7 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
 #include "video_core/churn_counters.h"
+#include "video_core/frame_end_trace.h"
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -84,6 +85,7 @@ BufferCache<P>::~BufferCache() {
 
 template <class P>
 void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
+    FrameEndTrace::Scope trace{"buffer garbage collection"};
     const u64 ticks_to_destroy = aggressive_gc ? 60 : 120;
     int num_iterations = aggressive_gc ? 64 : 32;
     // Their GPU-written data is downloaded first, all with one wait for the GPU: one wait per
@@ -124,8 +126,12 @@ void BufferCache<P>::TickFrame() {
     if (!channel_state) {
         return;
     }
-    runtime.TickFrame(slot_buffers);
+    {
+        FrameEndTrace::Scope trace{"buffer runtime maintenance"};
+        runtime.TickFrame(slot_buffers);
+    }
     if (!extent_probes.empty()) {
+        FrameEndTrace::Scope trace{"buffer extent probe checks"};
         CheckExtentProbes();
     }
     static const bool mem_trace = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
@@ -136,6 +142,7 @@ void BufferCache<P>::TickFrame() {
         }
     }
     if (frame_tick % 600 == 0 && !uploaded_buffer_ranges.empty()) {
+        FrameEndTrace::Scope trace{"buffer cold page hints"};
         for (const auto& [address, size] : uploaded_buffer_ranges) {
             device_memory.HintCold(address, size);
         }
@@ -190,20 +197,27 @@ void BufferCache<P>::TickFrame() {
         RunGarbageCollector(total_used_memory >= critical_memory);
     }
     ++frame_tick;
-    delayed_destruction_ring.Tick();
+    {
+        FrameEndTrace::Scope trace{"buffer delayed destruction"};
+        delayed_destruction_ring.Tick();
+    }
 
     // EDEN_NX2_EXP49: read downloads no thread waited for (the other ranges the guest read
     // before) land once the host GPU ran them.
     if constexpr (!IS_OPENGL) {
         if (!read_downloads.empty()) {
+            FrameEndTrace::Scope trace{"buffer completed read downloads"};
             (void)runtime.IsFreeNow(read_downloads.front().tick);
             WriteCompletedReadDownloads();
         }
     }
-    for (auto& buffer : async_buffers_death_ring) {
-        runtime.FreeDeferredStagingBuffer(buffer);
+    {
+        FrameEndTrace::Scope trace{"buffer async staging retirement"};
+        for (auto& buffer : async_buffers_death_ring) {
+            runtime.FreeDeferredStagingBuffer(buffer);
+        }
+        async_buffers_death_ring.clear();
     }
-    async_buffers_death_ring.clear();
 }
 
 template <class P>
@@ -909,6 +923,9 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         const DAddr diff = base_address - *cpu_src_address;
         const DAddr new_base_address = *cpu_dest_address + diff;
         tmp_intervals.push_back({new_base_address, size});
+        if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+            Tegra::Nx2MarkGpuWritten(new_base_address, size);
+        }
         QueueFenceDownload(new_base_address, size);
     };
     gpu_modified_ranges.ForEachInRange(*cpu_src_address, amount, mirror);
@@ -918,7 +935,6 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     for (const auto& pair : tmp_intervals) {
         gpu_modified_ranges.Add(pair.first, pair.second);
         if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
-            Tegra::Nx2MarkGpuWritten(pair.first, pair.second);
             Nx2NoteListWrite(buffer_b, pair.first, pair.second);
         }
     }
@@ -3230,9 +3246,12 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
     gpu_modified_ranges.Add(device_addr, size);
-    QueueFenceDownload(device_addr, size);
-    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+    const bool ampere = Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
+    if (ampere) {
         Tegra::Nx2MarkGpuWritten(device_addr, size);
+    }
+    QueueFenceDownload(device_addr, size);
+    if (ampere) {
         Nx2NoteListWrite(buffer_id, device_addr, size, capped);
     }
 }
@@ -3347,8 +3366,8 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick, u64 writer) {
 }
 
 template <class P>
-auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync)
-    -> Nx2ListRead {
+auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync,
+                                     Tegra::PendingListCopy* pending) -> Nx2ListRead {
     if constexpr (IS_OPENGL) {
         return Nx2ListRead::Unknown;
     } else {
@@ -3376,6 +3395,13 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
                 return Nx2ListRead::Unknown;
             }
             const Nx2ListPage& entry = it->second;
+            if (pending && pending->tick != 0 &&
+                (pending->device_addr != device_addr || !current(entry) ||
+                 pending->tick != entry.copy_tick || pending->writes != entry.copy_writes)) {
+                // Another channel replaced or dirtied the copy. Recover as for a generation
+                // change during the blocking wait below.
+                return Nx2ListRead::Unknown;
+            }
             if (entry.draw_written) {
                 // EDEN_NX2_CMDPAGE_DRAIN=1: drain and flush for every list on such pages.
                 static const bool always_drain = std::getenv("EDEN_NX2_CMDPAGE_DRAIN") != nullptr;
@@ -3407,8 +3433,17 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
             writes = entry.copy_writes;
             writer = entry.copy_writer;
         }
-        // Submitted with the work that wrote the page (Nx2CopyListPages's caller flushes).
-        runtime.WaitSubmittedTick(tick, writer);
+        // A deferred copy still needs the original wait to request its submission. After handoff
+        // to the Vulkan worker the tick can finish independently of this channel.
+        if (pending && tick < runtime.CurrentTick()) {
+            if (!runtime.IsListTickDone(tick)) {
+                *pending = {.tick = tick, .writer = writer, .device_addr = device_addr,
+                            .writes = writes};
+                return Nx2ListRead::Pending;
+            }
+        } else {
+            runtime.WaitSubmittedTick(tick, writer);
+        }
         std::scoped_lock lock{nx2_list_mutex};
         const auto it = nx2_list_pages.find(page);
         if (it == nx2_list_pages.end() || !current(it->second) || it->second.copy_tick != tick ||

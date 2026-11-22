@@ -343,6 +343,20 @@ if (UNIX AND NOT (LINUX OR WIN32))
 endif()
 
 # Build/optimization presets
+option(LICHII_ALLYX_Z1E "Build host code for the ROG Ally X Ryzen Z1 Extreme (Zen 4)" OFF)
+if (LICHII_ALLYX_Z1E)
+    if (NOT WIN32 OR NOT ARCHITECTURE_x86_64 OR NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        message(FATAL_ERROR "LICHII_ALLYX_Z1E requires Windows x64 and Clang/clang-cl.")
+    endif()
+    if (MSVC)
+        add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/clang:-march=znver4>
+                            $<$<COMPILE_LANGUAGE:C,CXX>:/clang:-mtune=znver4>)
+    else()
+        add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-march=znver4>
+                            $<$<COMPILE_LANGUAGE:C,CXX>:-mtune=znver4>)
+    endif()
+    message(STATUS "Ally X host target: Zen 4 (znver4); requires a compatible CPU")
+endif()
 if (CXX_GCC OR CXX_CLANG)
     if (ARCHITECTURE_x86_64)
         # See https://gcc.gnu.org/onlinedocs/gcc/x86-Options.html

@@ -38,6 +38,9 @@ class QueryCacheBase;
 
 namespace Vulkan {
 
+bool TextureWaitTraceEnabled();
+void ReportSlowTextureWait(const char* site, double milliseconds, u64 tick);
+
 class CommandPool;
 class Device;
 class Framebuffer;
@@ -255,10 +258,21 @@ public:
             }
             VideoCommon::BackWaitScope wait_scope{"Scheduler::Wait (host GPU execution)"};
             Common::Nx2Timeline::ArgSpan timeline_span{"wait for host GPU", {"tick", tick}};
+            const bool trace_texture_wait = TextureWaitTraceEnabled();
+            const auto gpu_wait_start = trace_texture_wait
+                                            ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
             master_semaphore->Wait(tick);
+            if (trace_texture_wait) {
+                ReportSlowTextureWait("GPU completion",
+                                      std::chrono::duration<double, std::milli>(
+                                          std::chrono::steady_clock::now() - gpu_wait_start)
+                                          .count(),
+                                      tick);
+            }
         }
-        const auto trace_waited = trace ? std::chrono::steady_clock::now()
-                                        : std::chrono::steady_clock::time_point{};
+        const auto trace_waited =
+            trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         double trace_requested_ms{};
         double trace_sleep_ms{};
         double trace_slept_ms{};

@@ -1439,6 +1439,10 @@ bool Device::GetSuitability(bool requires_swapchain) {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT;
         SetNext(next, properties.transform_feedback);
     }
+    if (extensions.pipeline_binary) {
+        properties.pipeline_binary.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_PROPERTIES_KHR;
+        SetNext(next, properties.pipeline_binary);
+    }
     if (extensions.maintenance5) {
         properties.maintenance5.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES_KHR;
@@ -1935,6 +1939,16 @@ void Device::RemoveUnsuitableExtensions() {
         RemoveExtensionFeature(extensions.shader_float8, features.shader_float8,
                                VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
     }
+
+    // AMD's driver does not persist dynamic-vertex-input pipelines (#1406). Keep their
+    // compiled binaries ourselves; other drivers retain their existing cache paths.
+    extensions.pipeline_binary = features.pipeline_binary.pipelineBinaries &&
+        extensions.maintenance5 &&
+        properties.driver.driverID == VK_DRIVER_ID_AMD_PROPRIETARY &&
+        !properties.pipeline_binary.pipelineBinaryPrefersInternalCache;
+    RemoveExtensionFeatureIfUnsuitable(extensions.pipeline_binary, features.pipeline_binary,
+                                       VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+    LOG_INFO(Render_Vulkan, "AMD pipeline binary cache capability: {}", extensions.pipeline_binary);
 
     // VK_KHR_maintenance6
     extensions.maintenance6 = features.maintenance6.maintenance6;

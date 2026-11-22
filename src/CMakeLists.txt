@@ -311,3 +311,4 @@ if (ANDROID)
 endif()
 
 include(GenerateDepHashes)
+include(${PROJECT_SOURCE_DIR}/tools/allyx/Performance4.cmake)

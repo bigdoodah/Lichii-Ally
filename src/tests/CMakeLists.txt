@@ -69,6 +69,7 @@ add_executable(tests
     video_core/pipeline_build.cpp
     video_core/oot_network.cpp
     video_core/page_filter.cpp
+    video_core/pipeline_binary_policy.cpp
     video_core/pipeline_cache_policy.cpp
     video_core/spirv_storage_alignment.cpp
     video_core/pipeline_optimization.cpp
@@ -78,6 +79,7 @@ add_executable(tests
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
     video_core/async_report_wait.cpp
+    video_core/transcode_reaper.cpp
     video_core/command_snapshot_suspensions.cpp
     video_core/pending_maps.cpp
     video_core/maxwell_fast_method.cpp
@@ -127,6 +129,7 @@ add_executable(tests
     common/multi_level_page_table.cpp
     common/page_table.cpp
     common/param_package.cpp
+    common/poll_window.cpp
     common/range_map.cpp
     common/ring_buffer.cpp
     common/scratch_buffer.cpp
@@ -183,7 +186,7 @@ target_link_libraries(tests PRIVATE common core audio_core input_common video_co
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
 if (TARGET dynarmic::dynarmic)
-    target_sources(tests PRIVATE core/window_trace.cpp)
+    target_sources(tests PRIVATE core/window_trace.cpp core/jit_codegen_options.cpp)
     target_link_libraries(tests PRIVATE dynarmic::dynarmic)
 endif()
 

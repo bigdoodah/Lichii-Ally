@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <chrono>
+
 #include <array>
 #include <functional>
 #include <optional>
@@ -18,6 +20,7 @@
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/game_dlss_status.h"
 #include "video_core/gpu.h"
+#include "video_core/pending_list_copy.h"
 #include "video_core/query_cache/types.h"
 #include "video_core/rasterizer_download_area.h"
 
@@ -143,12 +146,18 @@ public:
         /// Draws write the page: ask again with `past_sync` once the split's back ran the work
         /// before the last host-level wait (GpuSplit::WaitForSync)
         NeedsSync,
+        Pending, ///< The submitted copy must complete before this channel can continue.
     };
     virtual GpuWrittenList ReadGpuWrittenCommandList([[maybe_unused]] DAddr addr,
                                                      [[maybe_unused]] std::span<u8> out,
-                                                     [[maybe_unused]] bool past_sync) {
+                                                     [[maybe_unused]] bool past_sync,
+                                                     [[maybe_unused]] Tegra::PendingListCopy* pending = nullptr) {
         return GpuWrittenList::Unknown;
     }
+    virtual bool IsListTickDone([[maybe_unused]] u64 tick) { return false; }
+    virtual void WaitForListTick([[maybe_unused]] u64 tick) {}
+    virtual void TraceSuspendedListWait(u64, u64, std::chrono::steady_clock::time_point,
+                                        std::chrono::steady_clock::time_point) {}
 
     /// Switch 2: the front flushed this command list page with the split drained.
     virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}

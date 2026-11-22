@@ -37,11 +37,13 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/frame_end_trace.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/gpu_split.h"
 #include "video_core/gpu_wait_site.h"
 #include "video_core/native_query_trace.h"
+#include "video_core/query_dma_report_range.h"
 #include "video_core/native_indirect_reset.h"
 #include "video_core/render_trace.h"
 #include "video_core/indirect_reset.h"
@@ -2364,9 +2366,13 @@ void RasterizerVulkan::SubmitNx2ListCopies(u64 writer) {
 }
 
 VideoCore::RasterizerInterface::GpuWrittenList RasterizerVulkan::ReadGpuWrittenCommandList(
-    DAddr addr, std::span<u8> out, bool past_sync) {
+    DAddr addr, std::span<u8> out, bool past_sync, Tegra::PendingListCopy* pending) {
     // No cache lock: the front only reads the copies, under their own lock.
-    switch (buffer_cache.Nx2ReadListCopy(addr, out, past_sync)) {
+    switch (buffer_cache.Nx2ReadListCopy(addr, out, past_sync, pending)) {
+    case BufferCache::Nx2ListRead::Pending:
+        pending->driver_returned_at_start =
+            scheduler.GetMasterSemaphore().LastReturnedSubmitTick() >= pending->tick;
+        return GpuWrittenList::Pending;
     case BufferCache::Nx2ListRead::Copied:
         return GpuWrittenList::Copied;
     case BufferCache::Nx2ListRead::Synced:
@@ -2376,6 +2382,20 @@ VideoCore::RasterizerInterface::GpuWrittenList RasterizerVulkan::ReadGpuWrittenC
     default:
         return GpuWrittenList::Unknown;
     }
+}
+
+bool RasterizerVulkan::IsListTickDone(u64 tick) {
+    return buffer_cache_runtime.IsListTickDone(tick);
+}
+
+void RasterizerVulkan::TraceSuspendedListWait(u64 tick, u64 writer,
+                                             std::chrono::steady_clock::time_point start,
+                                             std::chrono::steady_clock::time_point observed) {
+    scheduler.GetMasterSemaphore().ReportListSubmitWait(tick, writer, start, observed, "suspended");
+}
+
+void RasterizerVulkan::WaitForListTick(u64 tick) {
+    scheduler.GetMasterSemaphore().Wait(tick);
 }
 
 void RasterizerVulkan::NoteGpuWrittenCommandListSynced(DAddr page) {
@@ -2579,14 +2599,17 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
 }
 
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushAreaLocked(DAddr addr, u64 size) {
-    {
+    if (VideoCore::Nx2Debug::Experiment(36) != 0 || texture_cache.page_filter.Any(addr, size)) {
         std::scoped_lock lock{texture_cache.mutex};
         auto area = texture_cache.GetFlushArea(addr, size);
         if (area) {
             return *area;
         }
     }
-    if (buffer_cache.FlushesOnCpuRead()) {
+    if (buffer_cache.FlushesOnCpuRead() &&
+        (VideoCore::Nx2Debug::Experiment(36) != 0 ||
+         !Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+         Tegra::Nx2MayBeGpuWritten(addr, size))) {
         std::scoped_lock lock{buffer_cache.mutex};
         auto area = buffer_cache.GetFlushArea(addr, size);
         if (area) {
@@ -2781,25 +2804,53 @@ u64 RasterizerVulkan::FenceWorkEpoch() const {
 }
 
 void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
-    if (addr == 0 || size == 0 || !query_cache.SemiFlushRegion(addr, size)) {
+    if (addr == 0 || size == 0) {
+        return;
+    }
+    const bool own_reports = VideoCore::Nx2Debug::Experiment(30) != 0;
+    const auto range = VideoCommon::QueryDma::ReportReadRange::FromRead(addr, size);
+    if (!range.NeedsFence(query_cache.SemiFlushRegion(addr, size), own_reports)) {
         return;
     }
     // GPU profile zone "query DMA wait": these waits per second and their ms per second, either
     // way below (the A/B measure for EXP30).
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::QueryDmaWait};
-    if (VideoCore::Nx2Debug::Experiment(30) != 0) {
+    static const bool trace = [] {
+        const char* value = std::getenv("EDEN_NX2_QUERY_WAIT_TRACE");
+        return value && std::string_view{value} == "1";
+    }();
+    using Clock = std::chrono::steady_clock;
+    const auto start = trace ? Clock::now() : Clock::time_point{};
+    const auto submit_reports = [&] {
+        fence_manager.SignalFence([] {});
+        scheduler.FlushDeferred();
+        return trace ? Clock::now() : Clock::time_point{};
+    };
+    const auto report_wait = [&](Clock::time_point after_flush) {
+        if (!trace) {
+            return;
+        }
+        const auto end = Clock::now();
+        if (end - start >= std::chrono::milliseconds{100}) {
+            using Ms = std::chrono::duration<double, std::milli>;
+            LOG_WARNING(Render_Vulkan,
+                        "Slow query DMA read: {:.3f} ms, path={}, thread={}, device_addr={:#x}, "
+                        "bytes={}, fence setup/flush {:.3f} ms, result wait {:.3f} ms",
+                        Ms{end - start}.count(), own_reports ? "report-range" : "queued-callback",
+                        VideoCommon::GpuSplit::OnBackThread() ? "split-back" : "unsplit",
+                        addr, size, Ms{after_flush - start}.count(), Ms{end - after_flush}.count());
+        }
+    };
+    if (own_reports) {
         // EXP30 (zortos293/Lichii#559): the fence carries the reports still waiting for one; on
         // the split's back its submission may be deferred, and the fencing thread would wait
         // for this thread to submit it. Then wait for the reports themselves, not for an
         // operation queued behind everything: the work submitted after them (a few ms of GPU
         // time while walking) cannot write them.
-        fence_manager.SignalFence([] {});
-        scheduler.FlushDeferred();
-        // From 12 bytes before the read: a 16-byte report (value, then timestamp) starting there
-        // still has words in it, and its slot is the one before the read's.
-        const DAddr wait_begin = addr >= 12 ? addr - 12 : DAddr{0};
+        const auto after_flush = submit_reports();
         VideoCommon::BackWaitScope wait_scope{"RasterizerVulkan::FlushQueryResults (own reports)"};
-        Tegra::Nx2WaitAsyncReportsSettled(wait_begin, addr + size - wait_begin);
+        Tegra::Nx2WaitAsyncReportsSettled(range.begin, range.size);
+        report_wait(after_flush);
         return;
     }
     // Below High GPU accuracy a fence runs its own callback at once, so wait for an operation
@@ -2813,10 +2864,12 @@ void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
         written = true;
         wait_cv.notify_all();
     });
-    fence_manager.SignalFence([] {});
-    scheduler.FlushDeferred();
-    std::unique_lock lock{wait_mutex};
-    wait_cv.wait(lock, [&written] { return written; });
+    const auto after_flush = submit_reports();
+    {
+        std::unique_lock lock{wait_mutex};
+        wait_cv.wait(lock, [&written] { return written; });
+    }
+    report_wait(after_flush);
 }
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
@@ -3428,6 +3481,7 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 void NoteDrawReuseProbeFrame(); // vk_graphics_pipeline.cpp
 
 void RasterizerVulkan::TickFrame() {
+    VideoCommon::FrameEndTrace::Scope early_trace{"rasterizer early diagnostics"};
     NoteDrawReuseProbeFrame();
     if (MemoryOwnersEnabled()) {
         static std::chrono::steady_clock::time_point last_owners_log{};
@@ -3523,18 +3577,37 @@ void RasterizerVulkan::TickFrame() {
     ComputePipeline::TickUpscalerTrace();
     draw_counter = 0;
     pending_native_work = false;
-    pipeline_cache.TickFrame();
-    guest_descriptor_queue.TickFrame();
-    compute_pass_descriptor_queue.TickFrame();
-    descriptor_buffer_ring.TickFrame();
-    fence_manager.TickFrame();
-    staging_pool.TickFrame();
+    early_trace.Finish();
     {
+        VideoCommon::FrameEndTrace::Scope trace{"pipeline maintenance"};
+        pipeline_cache.TickFrame();
+    }
+    {
+        VideoCommon::FrameEndTrace::Scope trace{"descriptor maintenance"};
+        guest_descriptor_queue.TickFrame();
+        compute_pass_descriptor_queue.TickFrame();
+        descriptor_buffer_ring.TickFrame();
+    }
+    {
+        VideoCommon::FrameEndTrace::Scope trace{"fence retirement"};
+        fence_manager.TickFrame();
+    }
+    {
+        VideoCommon::FrameEndTrace::Scope trace{"staging retirement"};
+        staging_pool.TickFrame();
+    }
+    {
+        VideoCommon::FrameEndTrace::Scope acquire_trace{"texture cache lock acquisition"};
         std::scoped_lock lock{texture_cache.mutex};
+        acquire_trace.Finish();
+        VideoCommon::FrameEndTrace::Scope trace{"texture cache maintenance"};
         texture_cache.TickFrame();
     }
     {
+        VideoCommon::FrameEndTrace::Scope acquire_trace{"buffer cache lock acquisition"};
         std::scoped_lock lock{buffer_cache.mutex};
+        acquire_trace.Finish();
+        VideoCommon::FrameEndTrace::Scope trace{"buffer cache maintenance"};
         buffer_cache.TickFrame();
     }
 }

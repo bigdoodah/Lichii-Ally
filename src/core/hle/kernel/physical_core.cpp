@@ -16,6 +16,7 @@
 #include "common/nx2_timeline.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "common/thread.h"
 #include "core/arm/debug.h"
 #include "core/core.h"
 #include "core/debugger/debugger.h"
@@ -342,9 +343,13 @@ void PhysicalCore::Idle(KernelCore& kernel) {
         spin_us = process != nullptr && process->IsSwitch2() ? 100 : 0;
 #endif
     }
-    const auto spin = std::chrono::microseconds{spin_us};
-    if (spin.count() > 0) {
-        const auto deadline = std::chrono::steady_clock::now() + spin;
+    const std::chrono::nanoseconds limit = std::chrono::microseconds{spin_us};
+    const auto start = std::chrono::steady_clock::now();
+    if (limit.count() > 0) {
+        if (m_idle_poll.count() <= 0 || m_idle_poll > limit) {
+            m_idle_poll = limit;
+        }
+        const auto deadline = start + m_idle_poll;
         if (IdlePauseOn()) {
             // EDEN_NX2_IDLE_PAUSE: the interrupt flag after every pause, the clock every 16.
             for (u32 n = 1; !m_is_interrupted.load(std::memory_order_acquire); ++n) {
@@ -354,10 +359,7 @@ void PhysicalCore::Idle(KernelCore& kernel) {
                 }
             }
         } else {
-            while (!m_is_interrupted.load(std::memory_order_acquire) &&
-                   std::chrono::steady_clock::now() < deadline) {
-                std::this_thread::yield();
-            }
+            Common::WaitForFlag(m_is_interrupted, deadline);
         }
     }
     if (m_core_lock) {
@@ -366,10 +368,14 @@ void PhysicalCore::Idle(KernelCore& kernel) {
         while (!m_is_interrupted.load(std::memory_order_acquire)) {
             m_is_interrupted.wait(false, std::memory_order_acquire);
         }
-        return;
+    } else {
+        std::unique_lock lk{m_guard};
+        m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load(); });
     }
-    std::unique_lock lk{m_guard};
-    m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load(); });
+    if (limit.count() > 0) {
+        m_idle_poll = Common::NextPollWindow(
+            m_idle_poll, std::chrono::steady_clock::now() - start, limit);
+    }
 }
 
 bool PhysicalCore::IsInterrupted() const {

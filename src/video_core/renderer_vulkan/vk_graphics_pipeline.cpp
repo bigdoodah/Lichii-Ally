@@ -28,6 +28,7 @@
 #include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
+#include "video_core/renderer_vulkan/pipeline_wait_trace.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -753,9 +754,8 @@ GraphicsPipeline::GraphicsPipeline(
     build.emplace(worker_thread, std::move(func));
 }
 
-void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
-    transition_keys.push_back(transition->key);
-    transitions.push_back(transition);
+void GraphicsPipeline::AddTransition(GraphicsPipeline* transition, u64 generation) {
+    transitions.Add(transition->key, transition, generation);
 }
 
 bool GraphicsPipeline::TextureMemoHit(const TextureCache::TextureMemoState& state,
@@ -1537,13 +1537,36 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         }
     }
 
+    const auto record_build_wait = [this] {
+        if (IsBuilt()) {
+            return;
+        }
+        scheduler.Record([this, tick = scheduler.CurrentTick()](vk::CommandBuffer) {
+            if (IsBuilt()) {
+                return;
+            }
+            const auto begin = PipelineWaitTrace::Clock::now();
+            const bool ran_build = build->Wait(!worker_only_build);
+            const auto end = PipelineWaitTrace::Clock::now();
+            const auto held = end - begin;
+            const auto held_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(held).count();
+            hold_time_ns.fetch_add(held_ns, std::memory_order_relaxed);
+            hold_time_total_ns.fetch_add(held_ns, std::memory_order_relaxed);
+            if (library_cache) {
+                library_cache->RecordHeldDraw(held);
+            }
+            if (PipelineWaitTrace::ShouldReport(held, end)) {
+                PipelineWaitTrace::Report(mesh_emulation ? "mesh graphics" : "graphics",
+                                          key.Hash(), tick, ran_build, held);
+            }
+        });
+    };
+
     if (mesh_emulation) {
         // The mesh program runs as a compute dispatch outside the render pass and writes the
         // triangles the draw then reads; both use the descriptor set committed here.
         scheduler.RequestOutsideRenderPassOperationContext();
-        if (!IsBuilt()) {
-            scheduler.Record([this](vk::CommandBuffer) { build->Wait(!worker_only_build); });
-        }
+        record_build_wait();
         // EDEN_NX2_MESH_FIRST: the task (or mesh) compute shader adds the draw's first
         // workgroup index, as the native mesh path does.
         const bool push_draw_base{MeshFirstEnabled()};
@@ -1684,20 +1707,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     if (writes_storage) {
         scheduler.NoteRenderPassStores();
     }
-    if (!IsBuilt()) {
-        // Wait for the pipeline to be built
-        scheduler.Record([this](vk::CommandBuffer) {
-            const auto begin = std::chrono::steady_clock::now();
-            build->Wait(!worker_only_build);
-            const auto held = std::chrono::steady_clock::now() - begin;
-            const auto held_ns =
-                std::chrono::duration_cast<std::chrono::nanoseconds>(held).count();
-            hold_time_ns.fetch_add(held_ns, std::memory_order::relaxed);
-            hold_time_total_ns.fetch_add(held_ns, std::memory_order::relaxed);
-            if (library_cache) {
-                library_cache->RecordHeldDraw(held);
-            }
-        });
+    if (!mesh_emulation) {
+        record_build_wait();
     }
     const bool is_rescaling{texture_cache.IsRescaling()};
     const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling, IsMeshPipeline())};
@@ -2245,6 +2256,27 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     if (IsMeshPipeline() && !device.IsExtMeshShaderSupported() && !mesh_emulation) {
         return;
     }
+    // CPU wall time includes binary-cache lookup/import or a cold driver compile, never GPU
+    // execution. The wait for one emulated draw can cover several of these pipeline creates.
+    const bool trace_build = PipelineWaitTrace::Enabled();
+    const auto report_create = [this, trace_build](const char* phase,
+                                                 PipelineWaitTrace::Clock::time_point begin) {
+        if (!trace_build) {
+            return;
+        }
+        const auto elapsed = PipelineWaitTrace::Clock::now() - begin;
+        if (elapsed <= std::chrono::milliseconds{250}) {
+            return;
+        }
+        static std::atomic<u32> reported{};
+        if (reported.fetch_add(1, std::memory_order_relaxed) >= 200) {
+            return;
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Slow pipeline create: {:016x} {} {:.3f} ms CPU wall time "
+                 "(binary-cache/driver call, not GPU execution)",
+                 key.Hash(), phase, std::chrono::duration<double, std::milli>(elapsed).count());
+    };
     if (mesh_emulation) {
         // The mesh program (stage 0, or mesh_stage after a task program in stage 0) is built as
         // a compute shader, and so is the task program; the draw uses the vertex shader that
@@ -2257,7 +2289,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
             .requiredSubgroupSize = GuestWarpSize,
         };
         const auto make_compute = [&](VkShaderModule module, VkPipelineLayout layout,
-                                      const Shader::Info* info) {
+                                      const Shader::Info* info, const char* phase) {
             const bool uses_warp_ops{info && (info->uses_subgroup_vote ||
                                               info->uses_subgroup_invocation_id ||
                                               info->uses_subgroup_shuffles ||
@@ -2265,7 +2297,9 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                                               info->uses_quad_shuffles || info->uses_fswzadd)};
             const bool force_warp_size{uses_warp_ops && device.IsExtSubgroupSizeControlSupported() &&
                                        device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)};
-            return device.GetLogical().CreateComputePipeline(
+            const auto begin = trace_build ? PipelineWaitTrace::Clock::now()
+                                           : PipelineWaitTrace::Clock::time_point{};
+            auto result = device.GetLogical().CreateComputePipeline(
                 VkComputePipelineCreateInfo{
                     .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                     .pNext = nullptr,
@@ -2284,17 +2318,19 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                     .basePipelineIndex = 0,
                 },
                 *pipeline_cache);
+            report_create(phase, begin);
+            return result;
         };
         mesh_vertex_module = BuildShader(device, mesh_emulation->vertex_spirv);
         mesh_compute_pipeline = make_compute(*spv_modules[mesh_emulation->mesh_stage],
                                              *pipeline_layout,
-                                             &stage_infos[mesh_emulation->mesh_stage]);
+                                             &stage_infos[mesh_emulation->mesh_stage], "mesh compute");
         if (mesh_emulation->has_task) {
             task_compute_pipeline =
-                make_compute(*spv_modules[0], *pipeline_layout, &stage_infos[0]);
+                make_compute(*spv_modules[0], *pipeline_layout, &stage_infos[0], "task compute");
             distribution_module = BuildShader(device, mesh_emulation->distribution_spirv);
             distribution_pipeline =
-                make_compute(*distribution_module, *distribution_layout, nullptr);
+                make_compute(*distribution_module, *distribution_layout, nullptr, "distribution compute");
         }
     }
     PipelineStates states;
@@ -2354,6 +2390,8 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
     }
 
+    const auto raster_begin = trace_build ? PipelineWaitTrace::Clock::now()
+                                          : PipelineWaitTrace::Clock::time_point{};
     pipeline = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = nullptr,
@@ -2379,6 +2417,8 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
     }, *pipeline_cache);
+
+    report_create(mesh_emulation ? "mesh raster" : "raster", raster_begin);
 
     // Log graphics pipeline creation
     if (GPU::Logging::IsActive()) {

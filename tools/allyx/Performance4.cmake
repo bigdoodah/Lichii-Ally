@@ -1,0 +1,12 @@
+# Focused upstream CPU regressions without configuring the complete emulator test suite.
+option(ALLYX_PERFORMANCE4_CHECKS "Build targeted Performance4 regressions" OFF)
+if (ALLYX_PERFORMANCE4_CHECKS)
+    add_executable(allyx_jit_codegen ${CMAKE_CURRENT_LIST_DIR}/Test-JitCodegen.cpp)
+    target_link_libraries(allyx_jit_codegen PRIVATE dynarmic::dynarmic common)
+    add_executable(allyx_jit_calls ${CMAKE_CURRENT_LIST_DIR}/Test-JitCalls.cpp)
+    target_link_libraries(allyx_jit_calls PRIVATE dynarmic::dynarmic common merry::oaknut)
+    add_executable(allyx_idle_wait ${CMAKE_CURRENT_LIST_DIR}/Test-IdleWait.cpp)
+    target_link_libraries(allyx_idle_wait PRIVATE common)
+    add_executable(allyx_cached_writes ${CMAKE_CURRENT_LIST_DIR}/Test-CachedWrites.cpp)
+    target_link_libraries(allyx_cached_writes PRIVATE frontend_common core video_core common ${PLATFORM_LIBRARIES})
+endif()

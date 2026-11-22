@@ -31,6 +31,16 @@ inline bool ApplyMarioKartWorldPreset(Values& settings, u64 program_id, bool acc
         return false;
     }
     SetMarioKartWorldRecommendedSettings(settings, false);
+
+    // Prefer a saved per-game mode. Older profiles can request both modes at once.
+    const bool dynamic_requested =
+        !settings.mkw_dynamic_fps.UsingGlobal() && settings.mkw_dynamic_fps.GetValue();
+    const bool fixed_30 =
+        settings.mkw_30fps.UsingGlobal() ? !dynamic_requested : settings.mkw_30fps.GetValue();
+    settings.mkw_30fps.SetGlobal(false);
+    settings.mkw_30fps.SetValue(fixed_30);
+    settings.mkw_dynamic_fps.SetGlobal(false);
+    settings.mkw_dynamic_fps.SetValue(dynamic_requested && !fixed_30);
     return true;
 }
 

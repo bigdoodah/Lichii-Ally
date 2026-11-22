@@ -89,6 +89,7 @@ enum class Zone : u32 {
     UniformBuffers,  ///< Of bind stage buffers: the uniform buffers
     GeometryBuffers, ///< Of update buffers: index and vertex buffer binds
     StorageBindings, ///< Of read handles: storage buffer addresses from constant buffers
+    TexturePrefault, ///< Windows page touches before a full CPU texture upload
     Count,
 };
 
@@ -106,7 +107,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "compute synchronize",
     "cb bind", "cb upload", "query report", "counter reset", "render enable", "sink",
     "macro end", "draw setup", "draw queries", "tick work", "uniform buffers",
-    "geometry buffers", "storage bindings",
+    "geometry buffers", "storage bindings", "texture prefault",
 };
 static_assert(zone_names.back() != nullptr, "a zone without a name");
 

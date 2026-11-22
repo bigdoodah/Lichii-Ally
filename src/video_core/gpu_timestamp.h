@@ -4,9 +4,16 @@
 #pragma once
 
 #include "common/common_types.h"
+#include "common/game_presets.h"
 #include "common/settings_enums.h"
 
 namespace Tegra {
+
+// Mario Kart World sizes its render targets from GPU report durations in GPU ticks.
+// See Eglantine #870 and Lichii #1817.
+[[nodiscard]] constexpr bool UsesLegacyAmpereTimestamps(u64 program_id) {
+    return program_id == Settings::MarioKartWorldProgramId;
+}
 
 /// How much faster Boost and Overclock make Switch 2 GPU work look.
 [[nodiscard]] constexpr u64 AmpereClockDivisor(Settings::GpuClock clock) {

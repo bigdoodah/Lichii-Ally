@@ -12,6 +12,7 @@
 #include "common/logging.h"
 #include "common/memory_detect.h"
 #include "common/thread.h"
+#include "core/zero_trim_policy.h"
 #endif
 
 #include "core/device_memory.h"
@@ -41,7 +42,9 @@ DeviceMemory::~DeviceMemory() = default;
 #ifdef _WIN32
 // Windows can't punch holes in the guest memory section, so pages holding only zeros (games clear
 // their heaps while booting: Ocarina leaves ~7 GB) stay resident until they leave the working set.
-// A pass comes every 5 s while they keep turning up, backing off to once a minute.
+// A pass comes every 5 s while they keep turning up, backing off to once every 5 minutes: after
+// boot most passes trim 1-2 MiB for about a second of work. It waits out bulk mapping (loads,
+// spawns), whose map calls stalled 10-14 ms while a pass ran.
 void DeviceMemory::TrimZeroPages(std::stop_token stop) {
     using namespace std::chrono_literals;
     Common::SetCurrentThreadName("ZeroTrim");
@@ -58,11 +61,36 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
         if (stop.stop_requested()) {
             return;
         }
+        bool mapping_idle = false;
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            const u64 before = Common::HostMemory::MappedBytes();
+            {
+                std::unique_lock lock{mutex};
+                wake.wait_for(lock, stop, 500ms, [] { return false; });
+            }
+            if (stop.stop_requested()) {
+                return;
+            }
+            if (Common::HostMemory::MappedBytes() - before < (u64{32} << 20)) {
+                mapping_idle = true;
+                break;
+            }
+        }
+        if (!mapping_idle) {
+            continue;
+        }
         const auto start = std::chrono::steady_clock::now();
-        const auto [resident, trimmed] = buffer.TrimZeroPages();
+        const auto result = TryZeroTrim([this] { return buffer.TrimZeroPages(); });
+        if (!result) {
+            // Adapted from Lichii #1353; no allocating log call on allocation failure.
+            interval = 60s;
+            continue;
+        }
+        const auto [resident, trimmed] = *result;
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - start)
                             .count();
+        interval = ZeroTrimInterval(interval, std::chrono::milliseconds{ms}, trimmed);
         if (trimmed < Busy) {
             // A slow pass is logged too: its working set query and page reads take ~1 s at
             // ~7 GB resident, and freezes need lining up against it (fable52_answer_1 M8c).
@@ -70,16 +98,15 @@ void DeviceMemory::TrimZeroPages(std::stop_token stop) {
                 LOG_INFO(HW_Memory,
                          "Zero-page pass: {} MiB trimmed of {} MiB resident in {} ms (next in {} s)",
                          trimmed >> 20, resident >> 20, ms,
-                         (std::min)(interval * 2, std::chrono::seconds{60}).count());
+                         interval.count());
             }
-            interval = (std::min)(interval * 2, std::chrono::seconds{60});
             continue;
         }
-        interval = 5s;
         LOG_INFO(HW_Memory,
                  "Trimmed {} MiB of all-zero guest pages out of {} MiB resident in {} ms; the kernel "
-                 "zero-filled {} MiB so far",
-                 trimmed >> 20, resident >> 20, ms, Common::HostMemory::ZeroFilledBytes() >> 20);
+                 "zero-filled {} MiB so far (next in {} s)",
+                 trimmed >> 20, resident >> 20, ms, Common::HostMemory::ZeroFilledBytes() >> 20,
+                 interval.count());
     }
 }
 

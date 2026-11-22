@@ -4,10 +4,12 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <thread>
 
 #include <ranges>
 #include "common/settings.h"
+#include "video_core/renderer_vulkan/list_submit_trace.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -16,7 +18,10 @@ namespace Vulkan {
 
 constexpr u64 FENCE_RESERVE_SIZE = 8;
 
-MasterSemaphore::MasterSemaphore(const Device& device_) : device(device_) {
+MasterSemaphore::MasterSemaphore(const Device& device_)
+    : device(device_), list_submit_trace{std::getenv("EDEN_NX2_LIST_WAIT_TRACE")
+                                             ? std::make_unique<ListSubmitTrace>()
+                                             : nullptr} {
     if (!device.HasTimelineSemaphore()) {
         static constexpr VkFenceCreateInfo fence_ci{
             .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .pNext = nullptr, .flags = 0};
@@ -120,12 +125,45 @@ void MasterSemaphore::Wait(u64 tick) {
 VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
                                       VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                                       u64 host_tick) {
-    if (semaphore) {
-        return SubmitQueueTimeline(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
-                                   host_tick);
-    } else {
-        return SubmitQueueFence(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, host_tick);
+    return semaphore ? SubmitQueueTimeline(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
+                                           host_tick)
+                     : SubmitQueueFence(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
+                                        host_tick);
+}
+
+template <typename Submit>
+VkResult MasterSemaphore::TraceQueueCall(u64 tick, Submit&& submit) {
+    if (!list_submit_trace) {
+        return submit();
     }
+    const auto entered = ListSubmitTrace::Clock::now();
+    const VkResult result = submit();
+    const auto returned = ListSubmitTrace::Clock::now();
+    if (result == VK_SUCCESS) {
+        list_submit_trace->Record(tick, entered, returned);
+        last_returned_submit_tick.store(tick, std::memory_order_relaxed);
+    }
+    return result;
+}
+
+void MasterSemaphore::ReportListSubmitWait(u64 tick, u64 writer,
+                                           std::chrono::steady_clock::time_point start,
+                                           std::chrono::steady_clock::time_point observed,
+                                           const char* kind) const {
+    if (!list_submit_trace) {
+        return;
+    }
+    const auto stages = list_submit_trace->Measure(tick, start, observed);
+    if (!stages) {
+        LOG_WARNING(Render_Vulkan, "List wait stages {} tick {} writer {:#018x}: unknown "
+                    "(exact successful queue call unavailable)", kind, tick, writer);
+        return;
+    }
+    using Ms = std::chrono::duration<double, std::milli>;
+    LOG_WARNING(Render_Vulkan, "List wait stages {} tick {} writer {:#018x}: before queue call "
+                "{:.3f} ms, in queue call {:.3f} ms, after return to front observation {:.3f} ms "
+                "(includes scheduling delay)", kind, tick, writer, Ms{stages->before}.count(),
+                Ms{stages->inside}.count(), Ms{stages->after}.count());
 }
 
 static constexpr VkPipelineStageFlags wait_stage_mask = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
@@ -198,7 +236,9 @@ VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
             .signalSemaphoreInfoCount = num_signal_semaphores,
             .pSignalSemaphoreInfos = signal_infos.data(),
         };
-        return device.GetGraphicsQueue().Submit2(submit_info2);
+        return TraceQueueCall(host_tick, [&] {
+            return device.GetGraphicsQueue().Submit2(submit_info2);
+        });
     }
 
     const u32 num_signal_semaphores = signal_semaphore ? 2 : 1;
@@ -236,7 +276,7 @@ VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
         .pSignalSemaphores = p_signal_sems,
     };
 
-    return device.GetGraphicsQueue().Submit(submit_info);
+    return TraceQueueCall(host_tick, [&] { return device.GetGraphicsQueue().Submit(submit_info); });
 }
 
 VkResult MasterSemaphore::SubmitQueueFence(vk::CommandBuffer& cmdbuf,
@@ -292,7 +332,9 @@ VkResult MasterSemaphore::SubmitQueueFence(vk::CommandBuffer& cmdbuf,
         };
 
         auto fence = GetFreeFence();
-        auto result = device.GetGraphicsQueue().Submit2(submit_info2, *fence);
+        const auto result = TraceQueueCall(host_tick, [&] {
+            return device.GetGraphicsQueue().Submit2(submit_info2, *fence);
+        });
 
         if (result == VK_SUCCESS) {
             std::scoped_lock lock{wait_mutex};
@@ -327,7 +369,9 @@ VkResult MasterSemaphore::SubmitQueueFence(vk::CommandBuffer& cmdbuf,
     };
 
     auto fence = GetFreeFence();
-    auto result = device.GetGraphicsQueue().Submit(submit_info, *fence);
+    const auto result = TraceQueueCall(host_tick, [&] {
+        return device.GetGraphicsQueue().Submit(submit_info, *fence);
+    });
 
     if (result == VK_SUCCESS) {
         std::scoped_lock lock{wait_mutex};

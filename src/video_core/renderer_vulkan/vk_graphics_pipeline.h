@@ -25,6 +25,7 @@
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/pipeline_build.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
+#include "video_core/renderer_vulkan/pipeline_transition_cache.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
@@ -254,19 +255,18 @@ public:
     GraphicsPipeline& operator=(const GraphicsPipeline&) = delete;
     GraphicsPipeline(const GraphicsPipeline&) = delete;
 
-    void AddTransition(GraphicsPipeline* transition);
+    void AddTransition(GraphicsPipeline* transition, u64 generation);
 
     bool Configure(bool is_indexed) {
         return configure_func(this, is_indexed);
     }
 
-    [[nodiscard]] GraphicsPipeline* Next(const GraphicsPipelineCacheKey& current_key) noexcept {
+    [[nodiscard]] GraphicsPipeline* Next(const GraphicsPipelineCacheKey& current_key,
+                                         u64 generation) noexcept {
         if (key == current_key) {
             return this;
         }
-        const auto it{std::find(transition_keys.begin(), transition_keys.end(), current_key)};
-        return it != transition_keys.end() ? transitions[std::distance(transition_keys.begin(), it)]
-                                           : nullptr;
+        return transitions.Find(current_key, generation);
     }
 
     /// The frame the pipeline cache last handed this pipeline out (evicts long unused ones).
@@ -296,8 +296,7 @@ public:
 
     /// Forgets the transitions, which may point to pipelines the cache evicted.
     void ClearTransitions() noexcept {
-        transition_keys.clear();
-        transitions.clear();
+        transitions.Clear();
     }
 
     [[nodiscard]] bool IsBuilt() const noexcept {
@@ -405,8 +404,7 @@ private:
 
     bool (*configure_func)(GraphicsPipeline*, bool){};
 
-    std::vector<GraphicsPipelineCacheKey> transition_keys;
-    std::vector<GraphicsPipeline*> transitions;
+    PipelineTransitionCache<GraphicsPipelineCacheKey, GraphicsPipeline> transitions;
     VideoCommon::EvictedPointerSlots::Slots mapped_pointers;
     u64 last_use_frame{};
     bool used{};

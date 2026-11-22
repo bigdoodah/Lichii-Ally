@@ -188,6 +188,20 @@ constexpr std::pair<const char*, const char*> BuiltinSwitches[] = {
     {"EDEN_NX2_UBO_INPLACE", "1"},        {"EDEN_NX2_PIPELINE_CLEAN", "1"},
     {"EDEN_NX2_LIST_WAIT_SKIP", "1"},     {"EDEN_NX2_PREFLUSH", "1"},
     {"EDEN_NX2_SEM_FAST", "2"},
+#ifdef LICHII_ALLYX_Z1E
+    // Performance13 LowMemory defaults for direct launches of the Ally X build.
+    // Switch files and explicit launcher variables retain their existing precedence.
+    {"EDEN_NX2_EXP49", "1"},
+    {"EDEN_NX2_GPU_PROFILE", "1"},
+    {"EDEN_NX2_LIST_WAIT_TRACE", "1"},
+    {"EDEN_NX2_FRAME_END_TRACE", "1"},
+    {"EDEN_NX2_LIST_YIELD", "1"},
+    {"EDEN_ALLYX_ASTC_LOW_MEMORY", "1"},
+    {"EDEN_NX2_EXP30", "1"},
+    {"EDEN_NX2_QUERY_WAIT_TRACE", "1"},
+    {"EDEN_ALLYX_MOTION_TRACE", "1"},
+    {"EDEN_NX2_TEXTURE_WAIT_TRACE", "1"},
+#endif
 };
 
 static void LoadNx2Switches(const char* argv0) {

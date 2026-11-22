@@ -2190,9 +2190,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             if (hit && range_skip) {
                 ++range_skips;
             }
-            // A report's value is up to 8 bytes, listed by its first 4: look 12 bytes back. A
-            // listed report may not be in guest memory yet: take the drained path.
-            if (!hit || !rasterizer->HasCachedReports(*device - 12, u64{read_bytes} + 12)) {
+            // Each report is listed by its first 4 bytes and can write 16 bytes.
+            const u64 prefix = (std::min)(u64{12}, *device);
+            if (!hit || !rasterizer->HasCachedReports(*device - prefix, read_bytes + prefix)) {
                 thread_local std::vector<u32> snap_words;
                 snap_words.resize(words);
                 if (hit) {

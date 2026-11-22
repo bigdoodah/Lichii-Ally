@@ -202,6 +202,10 @@ struct GPU::Impl {
 
     /// Tick pending requests within the GPU.
     void TickWork() {
+        if (list_copy_waits != 0) {
+            deferred_tick = true;
+            return;
+        }
         // EDEN_NX2_EXP29 & 2 (zortos293/Lichii#717 EDEN_NX2_OPT_TICKWORK): TickWork runs for
         // every draw, clear and dispatch; check without the mutex whether a request is queued
         // at all. A request queued after this check runs at the next TickWork, as one queued
@@ -226,7 +230,9 @@ struct GPU::Impl {
     }
 
     [[nodiscard]] u64 GetTicks() const {
-        return ReadGpuTimestamp(system.CoreTiming(), g_nx2_ampere.load(std::memory_order_relaxed),
+        const bool ampere = g_nx2_ampere.load(std::memory_order_relaxed) &&
+                            !UsesLegacyAmpereTimestamps(Settings::GetCurrentProgramID());
+        return ReadGpuTimestamp(system.CoreTiming(), ampere,
                                 Settings::values.gpu_clock.GetValue(),
                                 present_ns.load(std::memory_order_relaxed));
     }
@@ -480,6 +486,9 @@ struct GPU::Impl {
     /// Set with each request queued, cleared under the lock once TickWork emptied the queue
     /// (EXP29 & 2 reads it without the lock).
     std::atomic<bool> has_sync_requests{};
+    // Accessed only on the split's back while it runs, in the same FIFO as the draws.
+    u32 list_copy_waits{};
+    bool deferred_tick{};
     std::atomic<u64> current_sync_fence{};
     std::atomic<u64> present_ns{};
     u64 last_sync_fence{};
@@ -582,6 +591,18 @@ u64 GPU::CurrentSyncRequestFence() const {
 
 void GPU::WaitForSyncOperation(u64 fence) {
     return impl->WaitForSyncOperation(fence);
+}
+
+void GPU::BeginListCopyWait() {
+    ++impl->list_copy_waits;
+}
+
+void GPU::EndListCopyWait() {
+    ASSERT(impl->list_copy_waits != 0);
+    if (--impl->list_copy_waits == 0 && impl->deferred_tick) {
+        impl->deferred_tick = false;
+        impl->TickWork();
+    }
 }
 
 void GPU::TickWork() {

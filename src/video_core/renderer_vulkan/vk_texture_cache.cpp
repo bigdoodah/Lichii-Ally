@@ -38,6 +38,7 @@
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/framebuffer_limits.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
+#include "video_core/renderer_vulkan/vk_astc_transcode.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
@@ -46,6 +47,7 @@
 #include "video_core/surface.h"
 #include "video_core/texture_cache/formatter.h"
 #include "video_core/texture_cache/samples_helper.h"
+#include "video_core/texture_cache/transcode_reaper.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/dlss_contract.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -225,7 +227,22 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
         id != VK_DRIVER_ID_MESA_RADV) {
         return false;
     }
-    return HasUnevenBlockMips(info) && !IsHugeAstcArray(device, info);
+    const bool uneven = HasUnevenBlockMips(info) && !IsHugeAstcArray(device, info);
+    // Opt-in subset of Lichii #948. Keep AMD's seam workaround unless explicitly requested.
+    static const bool low_memory = AstcTranscode::LowMemoryEnabled(
+        std::getenv("EDEN_ALLYX_ASTC_LOW_MEMORY"), true);
+    if (uneven && low_memory && device.IsIntegrated()) {
+        static std::atomic_bool logged{};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Ally X ASTC low-memory mode: uneven mip arrays use BC1/BC3; "
+                        "distant terrain seams may appear on AMD. Decode scratch target {} MiB "
+                        "per image (minimum one layer; aligned layer offsets required)",
+                        AstcTranscode::MaxDecodeBytes >> 20);
+        }
+        return false;
+    }
+    return uneven;
 }
 
 // A large image over Switch 2 sparse blocks nobody has written (title 1's terrain layer pools, 2.9
@@ -3011,29 +3028,8 @@ void TextureCacheRuntime::TickFrame() {
         pending_byte_addressed_shadows.pop_front();
     }
     static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
-    // Finished decode images wait for the next texture of their shape, up to this much memory.
-    static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
-    const auto decode_bytes = [](const PendingTranscode& t) {
-        u64 bytes{};
-        for (u32 level = 0; level < t.levels; ++level) {
-            bytes += u64{(std::max)(t.width >> level, 1U)} * (std::max)(t.height >> level, 1U) * 4;
-        }
-        return bytes * t.layers;
-    };
-    u64 free_bytes{};
-    for (const PendingTranscode& t : free_transcodes) {
-        free_bytes += decode_bytes(t);
-    }
-    while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
-        PendingTranscode& done = pending_transcodes.front();
-        const u64 bytes = decode_bytes(done);
-        if (free_bytes + bytes <= MaxFreeTranscodeBytes) {
-            done.unused_frames = 0;
-            free_bytes += bytes;
-            free_transcodes.push_back(std::move(done));
-        }
-        pending_transcodes.pop_front();
-    }
+    VideoCommon::ReapFinishedTranscodes(scheduler, pending_transcodes, free_transcodes,
+                                       AstcTranscode::MaxDecodeBytes);
     std::erase_if(free_transcodes, [](PendingTranscode& t) {
         return ++t.unused_frames > MAX_UNUSED_SCRATCH_FRAMES;
     });
@@ -5186,18 +5182,38 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     // The BC encoder declares layout(rgba8). Identical byte layout is not enough:
     // its storage image view must have the matching R8G8B8A8_UNORM format.
     constexpr VkFormat DecodeFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    // Reuse scratch completed earlier in this frame before allocating the next decode image.
+    VideoCommon::ReapFinishedTranscodes(scheduler, pending_transcodes, free_transcodes,
+                                       AstcTranscode::MaxDecodeBytes);
     // A decode image of the same shape the GPU is done with: title 1's title screen decodes
     // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
     // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.
-    const auto reusable = std::ranges::find_if(free_transcodes, [&](const PendingTranscode& t) {
-        return t.width == width && t.height == height && t.levels == levels && t.layers == layers;
-    });
-    PendingTranscode pending;
-    if (reusable != free_transcodes.end()) {
-        pending = std::move(*reusable);
+    const auto take_free = [&](u32& batch_layers, PendingTranscode& out) {
+        auto reusable = std::ranges::find_if(free_transcodes, [&](const PendingTranscode& t) {
+            return t.width == width && t.height == height && t.levels == levels &&
+                   t.layers == batch_layers;
+        });
+        if (reusable == free_transcodes.end() && device.IsIntegrated() &&
+            AstcTranscode::CanOffsetLayers(info.layer_stride, device.GetStorageBufferAlignment())) {
+            // Reuse a driver-padded batch reduced by an earlier upload before allocating again.
+            for (auto it = free_transcodes.begin(); it != free_transcodes.end(); ++it) {
+                if (it->width == width && it->height == height && it->levels == levels &&
+                    it->layers <= batch_layers &&
+                    (reusable == free_transcodes.end() || it->layers > reusable->layers)) {
+                    reusable = it;
+                }
+            }
+        }
+        if (reusable == free_transcodes.end()) {
+            return false;
+        }
+        batch_layers = reusable->layers;
+        out = std::move(*reusable);
         free_transcodes.erase(reusable);
-    } else {
-        const VkImageCreateInfo decode_ci{
+        return true;
+    };
+    const auto make_decode = [&](u32& batch_layers) {
+        VkImageCreateInfo decode_ci{
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
@@ -5205,7 +5221,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             .format = DecodeFormat,
             .extent = {width, height, 1},
             .mipLevels = levels,
-            .arrayLayers = layers,
+            .arrayLayers = batch_layers,
             .samples = VK_SAMPLE_COUNT_1_BIT,
             .tiling = VK_IMAGE_TILING_OPTIMAL,
             .usage = VK_IMAGE_USAGE_STORAGE_BIT,
@@ -5214,13 +5230,51 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             .pQueueFamilyIndices = nullptr,
             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
         };
-        vk::Image decode = memory_allocator.TryCreateImage(decode_ci, true);
-        if (!decode && !free_transcodes.empty()) {
-            // The GPU is done with these: their memory goes back to the driver now.
-            free_transcodes.clear();
+        auto decode = memory_allocator.TryCreateImage(decode_ci, true);
+        // Driver tiling and alignment can exceed the logical texel estimate. Shrink before
+        // recording commands, so the completed image can fit the actual idle-pool budget.
+        while (decode && device.IsIntegrated() && batch_layers > 1 &&
+               AstcTranscode::CanOffsetLayers(info.layer_stride, device.GetStorageBufferAlignment()) &&
+               decode.GetMemoryBlock().size > AstcTranscode::MaxDecodeBytes) {
+            decode = {};
+            batch_layers = Common::DivCeil(batch_layers, 2U);
+            decode_ci.arrayLayers = batch_layers;
             decode = memory_allocator.TryCreateImage(decode_ci, true);
         }
-        if (!decode) {
+        return decode;
+    };
+    // Lichii #1083/#1796/#1823: bound temporary RGBA8 storage without changing the BC layout.
+    // Keep the original path if a layer offset cannot satisfy the device's descriptor alignment.
+    const bool can_batch = AstcTranscode::CanOffsetLayers(
+        info.layer_stride, device.GetStorageBufferAlignment());
+    u32 batch = AstcTranscode::InitialBatchLayers(
+        layers, AstcTranscode::DecodedLayerBytes(width, height, levels),
+        device.IsIntegrated() && can_batch);
+    PendingTranscode pending;
+    bool reused = take_free(batch, pending);
+    if (!reused) {
+        vk::Image decode = make_decode(batch);
+        // The whole array does not fit. A free image with fewer layers comes first: a texture
+        // that was decoded in batches gets back the image its last upload used, and the rest of
+        // the pool is kept. Emptying the pool first destroyed that image on every upload, only
+        // to make the same one again.
+        for (u32 fewer = batch; !decode && !reused && can_batch && fewer > 1;) {
+            fewer = Common::DivCeil(fewer, 2U);
+            if (take_free(fewer, pending)) {
+                batch = fewer;
+                reused = true;
+            }
+        }
+        if (!decode && !reused && !free_transcodes.empty()) {
+            // The GPU is done with these: their memory goes back to the driver now.
+            free_transcodes.clear();
+            decode = make_decode(batch);
+        }
+        while (!decode && !reused && can_batch && batch > 1) {
+            batch = Common::DivCeil(batch, 2U);
+            decode = make_decode(batch);
+        }
+        if (!decode && !reused) {
             static u32 logged{};
             if (logged++ < 32) {
                 LOG_ERROR(Render_Vulkan,
@@ -5232,44 +5286,47 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             TransitionImageLayout(image);
             return;
         }
-        pending = PendingTranscode{
-            .tick = 0,
-            .image = std::move(decode),
-            .views = {},
-            .width = width,
-            .height = height,
-            .levels = levels,
-            .layers = layers,
-            .unused_frames = 0,
-        };
-        for (u32 level = 0; level < levels; ++level) {
-            pending.views.push_back(
-                MakeStorageView(device.GetLogical(), level, *pending.image, DecodeFormat));
+        if (batch != layers) {
+            static u32 batch_logged{};
+            if (batch_logged++ < 32) {
+                LOG_WARNING(Render_Vulkan,
+                            "ASTC image {:#x} ({}x{}, {} levels, {} layers) decoded {} layers at a "
+                            "time (bounded decode scratch)",
+                            image.gpu_addr, width, height, levels, layers, batch);
+            }
+        }
+        if (!reused) {
+            pending = PendingTranscode{
+                .tick = 0,
+                .allocated_bytes = decode.GetMemoryBlock().size,
+                .image = std::move(decode),
+                .views = {},
+                .width = width,
+                .height = height,
+                .levels = levels,
+                .layers = batch,
+                .unused_frames = 0,
+            };
+            for (u32 level = 0; level < levels; ++level) {
+                pending.views.push_back(
+                    MakeStorageView(device.GetLogical(), level, *pending.image, DecodeFormat));
+            }
         }
     }
-    astc_decoder_pass->AssembleInto(
-        info, 0, image.guest_size_bytes,
-        ASTCDecoderPass::Target{
-            .image = *pending.image,
-            .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .initialized = false,
-            .level_view = [&pending](s32 level) { return *pending.views[level]; },
-            .wait = true,
-        },
-        map, swizzles);
 
     // Encode every level into one buffer, then copy it into the image.
     const bool bc3 = !IsOpaqueBc1Astc(device, info) &&
                      Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc1;
-    const u64 block_bytes = bc3 ? 16 : 8;
     boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
+    boost::container::small_vector<u64, 16> layer_bytes; // one encoded layer of each level
     u64 total = 0;
     for (u32 level = 0; level < levels; ++level) {
         const u32 level_width = (std::max)(width >> level, 1U);
         const u32 level_height = (std::max)(height >> level, 1U);
         const u32 blocks_x = Common::DivCeil(level_width, 4U);
         const u32 blocks_y = Common::DivCeil(level_height, 4U);
-        const u64 size = u64{blocks_x} * blocks_y * layers * block_bytes;
+        layer_bytes.push_back(AstcTranscode::EncodedLayerBytes(level_width, level_height, bc3));
+        const u64 size = layer_bytes.back() * layers;
         copies.push_back({
             .buffer_offset = total,
             .buffer_size = size,
@@ -5285,11 +5342,47 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
         });
         total += size;
     }
-    const auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal);
-    for (u32 level = 0; level < levels; ++level) {
-        bc_encoder_pass->Encode(*pending.views[level], copies[level].image_extent.width,
-                                copies[level].image_extent.height, layers, bc3, output.buffer,
-                                output.offset, total, copies[level].buffer_offset);
+    // Deferred, and stamped once the copy below is recorded. The decode submits (wait), so a
+    // buffer stamped now carried the tick before that submit while the encode and the copy ran
+    // in the next one: the pool could hand it to the next transcode, or free it, once the GPU
+    // was past the decode, and two textures' blocks met in one buffer.
+    auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal, true);
+
+    const u64 layer_stride = info.layer_stride;
+    const size_t guest_size = image.guest_size_bytes;
+    for (u32 base = 0; base < layers; base += batch) {
+        const u32 count = (std::min)(batch, layers - base);
+        // The swizzles describe one layer's levels and the decoder steps layer_stride per layer
+        // from the start of its input, so a batch is the same info with fewer layers, read from
+        // its first layer on. The swizzle math does not depend on the layer count.
+        ImageInfo batch_info = info;
+        batch_info.resources.layers = static_cast<s32>(count);
+        StagingBufferRef batch_map = map;
+        batch_map.offset += u64{base} * layer_stride;
+        const size_t batch_size =
+            batch == layers ? guest_size
+                            : static_cast<size_t>(AstcTranscode::BatchInputBytes(
+                                  guest_size, layer_stride, base, count));
+        astc_decoder_pass->AssembleInto(
+            batch_info, 0, batch_size,
+            ASTCDecoderPass::Target{
+                .image = *pending.image,
+                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                // A later batch overwrites what the previous batch's encode read: its barrier
+                // waits for that (initialized).
+                .initialized = base != 0,
+                .level_view = [&pending](s32 level) { return *pending.views[level]; },
+                // Only the last batch submits. `map` carries this tick: a later batch reading it
+                // after a submit could find it freed, or refilled with the next upload.
+                .wait = base + count >= layers,
+            },
+            batch_map, swizzles);
+        for (u32 level = 0; level < levels; ++level) {
+            bc_encoder_pass->Encode(*pending.views[level], copies[level].image_extent.width,
+                                    copies[level].image_extent.height, count, bc3, output.buffer,
+                                    output.offset, total,
+                                    copies[level].buffer_offset + layer_bytes[level] * base);
+        }
     }
     scheduler.Record([](vk::CommandBuffer cmdbuf) {
         const VkMemoryBarrier barrier{
@@ -5302,6 +5395,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                                0, barrier);
     });
     image.UploadMemory(output.buffer, output.offset, copies);
+    staging_buffer_pool.FreeDeferred(output);
     pending.tick = scheduler.CurrentTick();
     pending_transcodes.push_back(std::move(pending));
 }

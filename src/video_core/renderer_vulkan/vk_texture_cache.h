@@ -343,6 +343,7 @@ public:
     /// Temporary decode images, reusable once the GPU is past `tick`.
     struct PendingTranscode {
         u64 tick;
+        u64 allocated_bytes;
         vk::Image image;
         std::vector<vk::ImageView> views;
         u32 width;

@@ -7,8 +7,10 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <queue>
@@ -20,6 +22,7 @@
 namespace Vulkan {
 
 class Device;
+class ListSubmitTrace;
 
 class MasterSemaphore {
     using Waitable = std::pair<u64, vk::Fence>;
@@ -37,6 +40,15 @@ public:
     [[nodiscard]] u64 KnownGpuTick() const noexcept {
         return gpu_tick.load(std::memory_order_acquire);
     }
+
+    /// Diagnostic watermark for list waits. Published after a successful queue submit returns.
+    /// Only tracked with EDEN_NX2_LIST_WAIT_TRACE. It does not indicate GPU completion.
+    [[nodiscard]] u64 LastReturnedSubmitTick() const noexcept {
+        return last_returned_submit_tick.load(std::memory_order_relaxed);
+    }
+
+    void ReportListSubmitWait(u64 tick, u64 writer, std::chrono::steady_clock::time_point start,
+                              std::chrono::steady_clock::time_point observed, const char* kind) const;
 
     /// Returns true when a tick has been hit by the GPU.
     [[nodiscard]] bool IsFree(u64 tick) const noexcept {
@@ -59,6 +71,9 @@ public:
                          VkSemaphore signal_semaphore, VkSemaphore wait_semaphore, u64 host_tick);
 
 private:
+    template <typename Submit>
+    VkResult TraceQueueCall(u64 tick, Submit&& submit);
+
     VkResult SubmitQueueTimeline(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
                                  VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                                  u64 host_tick);
@@ -77,6 +92,8 @@ private:
     /// threads refreshing gpu_tick would otherwise make each of those reads miss.
     alignas(64) std::atomic<u64> gpu_tick{0};     ///< Current known GPU tick.
     alignas(64) std::atomic<u64> current_tick{1}; ///< Current logical tick.
+    alignas(64) std::atomic<u64> last_returned_submit_tick{};
+    const std::unique_ptr<ListSubmitTrace> list_submit_trace;
     alignas(64) std::mutex wait_mutex;
     std::mutex free_mutex;
     std::condition_variable_any wait_cv;

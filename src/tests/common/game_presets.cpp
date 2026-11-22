@@ -98,6 +98,43 @@ TEST_CASE("MKW preset does not change unrelated games", "[game_presets]") {
     CHECK(settings->resolution_setup.UsingGlobal());
 }
 
+TEST_CASE("MKW preset chooses one frame mode for the session", "[game_presets]") {
+    auto settings = std::make_unique<Settings::Values>();
+    settings->mkw_dynamic_fps.SetValue(true);
+    settings->mkw_30fps.SetValue(false);
+    bool expect_fixed = true;
+    bool expect_dynamic = false;
+    SECTION("inherited modes use the recommended fixed frame rate") {}
+    SECTION("two explicit modes select fixed 30") {
+        settings->mkw_30fps.SetGlobal(false);
+        settings->mkw_30fps.SetValue(true);
+        settings->mkw_dynamic_fps.SetGlobal(false);
+        settings->mkw_dynamic_fps.SetValue(true);
+    }
+    SECTION("explicit dynamic mode beats an inherited fixed setting") {
+        settings->mkw_dynamic_fps.SetGlobal(false);
+        settings->mkw_dynamic_fps.SetValue(true);
+        expect_fixed = false;
+        expect_dynamic = true;
+    }
+    SECTION("explicitly disabling both modes keeps the game's default") {
+        settings->mkw_dynamic_fps.SetGlobal(false);
+        settings->mkw_dynamic_fps.SetValue(false);
+        settings->mkw_30fps.SetGlobal(false);
+        settings->mkw_30fps.SetValue(false);
+        expect_fixed = false;
+    }
+    REQUIRE(Settings::ApplyMarioKartWorldPreset(*settings, Settings::MarioKartWorldProgramId, true));
+    CHECK(settings->mkw_30fps.GetValue() == expect_fixed);
+    CHECK(settings->mkw_dynamic_fps.GetValue() == expect_dynamic);
+    for (const auto& restore : settings->linkage.restore_functions) {
+        restore();
+    }
+    CHECK_FALSE(Settings::ApplyMarioKartWorldPreset(*settings, 0x0400486024DEC000ULL, true));
+    CHECK_FALSE(settings->mkw_30fps.GetValue());
+    CHECK(settings->mkw_dynamic_fps.GetValue());
+}
+
 TEST_CASE("Declining the MKW preset preserves global and per-game preferences", "[game_presets]") {
     auto settings = std::make_unique<Settings::Values>();
     for (bool per_game : {false, true}) {

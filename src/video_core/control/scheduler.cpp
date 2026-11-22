@@ -41,20 +41,38 @@ void Scheduler::Push(GPU& gpu, s32 channel, CommandList&& entries) {
         ASSERT(it != channels.end());
         channel_state = it->second;
     }
-    BindChannel(gpu, channel_state->bind_id);
-    // Process commands outside the lock to reduce contention.
-    // Multiple channels can prepare their commands in parallel.
-    channel_state->payload->dma_pusher.Push(std::move(entries));
-    channel_state->payload->dma_pusher.DispatchCalls();
-    if (channel_state->payload->dma_pusher.HasPendingAcquire() &&
+    auto& dma = channel_state->payload->dma_pusher;
+    const bool pending_copy = dma.HasPendingListRead();
+    if (!pending_copy) {
+        BindChannel(gpu, channel_state->bind_id);
+    }
+    dma.Push(std::move(entries));
+    if (!pending_copy) {
+        dma.DispatchCalls();
+    }
+    if (dma.IsSuspended() &&
         std::find(pending_channels.begin(), pending_channels.end(), channel_state) ==
             pending_channels.end()) {
         pending_channels.push_back(channel_state);
-        any_pending.store(true, std::memory_order_release);
+        if (dma.HasPendingAcquire()) {
+            any_pending.store(true, std::memory_order_release);
+        }
     }
     if (!pending_channels.empty()) {
         ResumePending(gpu);
     }
+}
+
+void Scheduler::FinishPendingListReads(GPU& gpu) {
+    for (const auto& state : pending_channels) {
+        auto& dma = state->payload->dma_pusher;
+        if (dma.HasPendingListRead() && dma.system.IsPoweredOn()) {
+            dma.WaitForPendingListRead();
+            BindChannel(gpu, state->bind_id);
+            dma.DispatchCalls(false);
+        }
+    }
+    RefreshPendingChannels();
 }
 
 void Scheduler::ResumePending(GPU& gpu) {
@@ -69,7 +87,7 @@ void Scheduler::ResumePending(GPU& gpu) {
             if (!dma_pusher.system.IsPoweredOn()) {
                 return;
             }
-            if (!dma_pusher.HasPendingAcquire() || !dma_pusher.CanResumeAcquire()) {
+            if (!dma_pusher.IsSuspended() || !dma_pusher.CanResumeAcquire()) {
                 continue;
             }
             BindChannel(gpu, state->bind_id);
@@ -77,10 +95,17 @@ void Scheduler::ResumePending(GPU& gpu) {
             progress = true;
         }
     }
+    RefreshPendingChannels();
+}
+
+void Scheduler::RefreshPendingChannels() {
     std::erase_if(pending_channels, [](const auto& state) {
-        return !state->payload->dma_pusher.HasPendingAcquire();
+        return !state->payload->dma_pusher.IsSuspended();
     });
-    any_pending.store(!pending_channels.empty(), std::memory_order_release);
+    const bool guest_wait = std::ranges::any_of(pending_channels, [](const auto& state) {
+        return state->payload->dma_pusher.HasPendingAcquire();
+    });
+    any_pending.store(guest_wait, std::memory_order_release);
 }
 
 void Scheduler::DeclareChannel(std::shared_ptr<ChannelState> new_channel) {

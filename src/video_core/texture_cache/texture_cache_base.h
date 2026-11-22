@@ -60,6 +60,8 @@ struct ChannelState;
 
 namespace VideoCommon {
 
+struct TextureUploadTiming;
+
 using Tegra::Texture::TICEntry;
 using Tegra::Texture::TSCEntry;
 using VideoCore::Surface::PixelFormat;
@@ -153,6 +155,12 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 native_critical_memory{};
     u64 native_expected_memory{};
     u64 budget_check_frames{};
+    /// Usage under which the collector keeps recently used images (EvictionAge): the driver's
+    /// budget less the out-of-memory and block slack margins, within the host's commit bound.
+    /// Not less the base margin too: a Mario Kart World race on a 7.6 GB budget then reached it
+    /// (6.48 GB) and the collector deleted ~40 recently used images a frame again; images that
+    /// do not fit add to the out-of-memory margin.
+    u64 retention_limit{};
     u64 logged_critical_memory{}; ///< The critical threshold of the last thresholds line logged
     u32 seen_pressure_events{};   ///< Allocator pressure events already answered
     u32 seen_failed_images{};     ///< Images the allocator could not make, already collected for
@@ -188,7 +196,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     static constexpr size_t LargeScratchCapacity = 64U << 20;
 
     /// Splits large 2D image uploads into smaller chunks, avoiding multi-hundred MiB staging buffers.
-    bool UploadInChunks(Image& image);
+    bool UploadInChunks(Image& image, TextureUploadTiming& timing);
 
     /// Large layered images whose refresh can decode only the layers written since the last one.
     [[nodiscard]] bool UploadsByLayer(const ImageBase& image) const noexcept;
@@ -520,7 +528,7 @@ private:
 
     /// Upload data from guest to an image
     template <typename StagingBuffer>
-    void UploadImageContents(Image& image, StagingBuffer& staging_buffer);
+    void UploadImageContents(Image& image, StagingBuffer& staging_buffer, TextureUploadTiming& timing);
 
     /// Create a new image view from a guest descriptor
     [[nodiscard]] ImageViewId CreateImageView(const TICEntry& config);
@@ -581,7 +589,12 @@ private:
     void RegisterImage(ImageId image);
 
     /// Unregister image from the page table
-    void UnregisterImage(ImageId image);
+    void UnregisterImage(ImageId image, const char* reason);
+
+    void TraceImageLifetime(ImageId image, const char* event);
+    u32 image_lifetime_reports = 0;
+    u64 costly_retention_skips = 0;
+    u64 costly_retention_log_frame = 0;
 
     /// Track CPU reads and writes for image
     void TrackImage(ImageBase& image, ImageId image_id);

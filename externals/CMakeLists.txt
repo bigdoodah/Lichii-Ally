@@ -74,7 +74,7 @@ if (YUZU_STATIC_ROOM)
 endif()
 
 # Oaknut
-if (ARCHITECTURE_arm64 OR DYNARMIC_TESTS)
+if (ARCHITECTURE_arm64 OR DYNARMIC_TESTS OR ALLYX_PERFORMANCE4_CHECKS)
     AddJsonPackage(oaknut)
 endif()
 

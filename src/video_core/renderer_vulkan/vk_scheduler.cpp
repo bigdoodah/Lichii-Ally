@@ -48,7 +48,7 @@ bool TextureWaitTraceEnabled() {
 }
 
 void ReportSlowTextureWait(const char* site, double milliseconds, u64 tick,
-                           double queue_ms = -1.0, double execution_ms = -1.0) {
+                           double queue_ms, double execution_ms) {
     if (milliseconds < 100.0) {
         return;
     }
@@ -65,6 +65,10 @@ void ReportSlowTextureWait(const char* site, double milliseconds, u64 tick,
                         site, milliseconds, tick);
         }
     }
+}
+
+void ReportSlowTextureWait(const char* site, double milliseconds, u64 tick) {
+    ReportSlowTextureWait(site, milliseconds, tick, -1.0, -1.0);
 }
 
 namespace {
